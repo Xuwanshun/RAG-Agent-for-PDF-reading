@@ -1,0 +1,10 @@
+# Runtime dependencies for local Linux execution.
+# Optional: install `chromadb` separately if you want the Chroma vector store backend.
+pydantic>=2.10,<3
+python-dotenv>=1.0,<2
+Pillow>=10.0,<12
+pypdfium2>=4.30,<5
+paddlepaddle>=3.2,<4
+paddleocr>=3.3,<4
+paddlex[ocr]>=3.4,<4
+openai>=2.30,<3

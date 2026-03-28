@@ -1,25 +1,19 @@
 from __future__ import annotations
 
 import hashlib
-import html
 import json
 import logging
-import re
+import os
 import shutil
-import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from config import Settings
-from document_Process.clients import build_agent_repair_client
 from document_Process.models import (
-    AgentAnalysisResult,
-    AgentInput,
-    AgentToolCall,
     BoundingBox,
-    ChartAnalysisOutput,
     CroppedRegionAsset,
     LayoutRegion,
     OCRPageResult,
@@ -27,17 +21,47 @@ from document_Process.models import (
     OrderedTextBlock,
     ProcessedChunk,
     ProcessedDocument,
+    ProcessedManifest,
     ProcessingIssue,
     ProcessingMetadata,
     RegionAssociation,
-    TableAnalysisOutput,
+    VisualRegionSummary,
 )
-from document_Process.prompts import SYSTEM_PROMPT
-from document_Process.tools import TOOL_DESCRIPTORS
 
 
 SUPPORTED_SUFFIXES = {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
+TEXT_BLOCK_LABELS = {
+    "text",
+    "title",
+    "doc_title",
+    "figure_title",
+    "paragraph_title",
+    "header",
+    "footer",
+    "reference",
+    "caption",
+    "list",
+    "number",
+    "formula_caption",
+    "table_caption",
+    "figure_caption",
+    "aside_text",
+}
+FIGURE_LABELS = {"image", "figure", "chart", "graph"}
 logger = logging.getLogger(__name__)
+
+
+def _configure_paddle_env() -> None:
+    cache_home = Path(".paddlex").resolve()
+    cache_home.mkdir(parents=True, exist_ok=True)
+    (cache_home / "temp").mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("PADDLE_PDX_CACHE_HOME", str(cache_home))
+    os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+
+
+_configure_paddle_env()
 
 
 @dataclass(frozen=True)
@@ -46,8 +70,6 @@ class PageContext:
     width: float | None
     height: float | None
     page_image_path: Path
-    native_text_blocks: list[dict[str, Any]]
-    native_text: str
 
 
 @dataclass(frozen=True)
@@ -59,18 +81,9 @@ class LoadedDocument:
     pages: list[PageContext]
 
 
-@dataclass(frozen=True)
-class AgentExecutionResult:
-    tool_results: list[dict[str, Any]]
-    summary: AgentAnalysisResult
-    model_name: str | None
-    issues: list[ProcessingIssue]
-
-
 class DocumentLoaderService:
-    def __init__(self, settings: Settings, *, native_pdf_tool: Any | None = None) -> None:
+    def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.native_pdf_tool = native_pdf_tool or _build_native_pdf_tool(settings)
 
     def load(self, source_path: Path, *, document_id: str | None = None) -> LoadedDocument:
         logger.info("Loading document for preprocessing: %s", source_path)
@@ -79,6 +92,8 @@ class DocumentLoaderService:
 
         resolved_id = document_id or self._build_document_id(source_path)
         working_dir = self.settings.processed_documents_dir / resolved_id
+        if working_dir.exists():
+            shutil.rmtree(working_dir)
         source_dir = working_dir / "source"
         pages_dir = source_dir / "pages"
         source_dir.mkdir(parents=True, exist_ok=True)
@@ -88,53 +103,9 @@ class DocumentLoaderService:
             shutil.copy2(source_path, original_copy_path)
 
         if original_copy_path.suffix.lower() == ".pdf":
-            if self.native_pdf_tool is not None:
-                inspected_pages = self.native_pdf_tool.inspect(original_copy_path, artifact_dir=pages_dir)
-                pages: list[PageContext] = []
-                for page in inspected_pages:
-                    image_path = page.page_image_path
-                    if image_path is None:
-                        image_path = pages_dir / f"page_{page.page_no}.png"
-                        self.native_pdf_tool.render_page(original_copy_path, page.page_no, image_path)
-                    pages.append(
-                        PageContext(
-                            page_number=page.page_no,
-                            width=page.width,
-                            height=page.height,
-                            page_image_path=image_path,
-                            native_text_blocks=[{"text": block.text, "bbox": block.bbox} for block in page.text_blocks],
-                            native_text=page.native_text,
-                        )
-                    )
-            else:
-                pages = _load_pdf_with_system_pdfkit(original_copy_path, pages_dir)
-                if not pages:
-                    native_text = _extract_pdf_text_fallback(original_copy_path)
-                    if not native_text.strip():
-                        raise RuntimeError(
-                            "No PDF extraction backend is available. Install the project's PDF tools or provide a text-extractable PDF."
-                        )
-                    pages = [
-                        PageContext(
-                            page_number=1,
-                            width=None,
-                            height=None,
-                            page_image_path=original_copy_path,
-                            native_text_blocks=[],
-                            native_text=native_text,
-                        )
-                    ]
+            pages = _load_pdf_pages(original_copy_path, pages_dir, render_scale=self.settings.pdf_render_scale)
         else:
-            pages = [
-                PageContext(
-                    page_number=1,
-                    width=None,
-                    height=None,
-                    page_image_path=original_copy_path,
-                    native_text_blocks=[],
-                    native_text="",
-                )
-            ]
+            pages = [_load_image_page(original_copy_path, page_number=1)]
 
         return LoadedDocument(
             document_id=resolved_id,
@@ -153,65 +124,60 @@ class DocumentLoaderService:
 
 
 class OCRService:
-    def __init__(self, *, paddleocr_tool: Any | None = None, language: str = "en") -> None:
-        self.paddleocr_tool = paddleocr_tool or _build_paddleocr_tool(language=language)
-
     def extract(self, pages: list[PageContext]) -> tuple[list[OCRPageResult], list[ProcessingIssue]]:
-        logger.info("Running PaddleOCR on %s page(s)", len(pages))
+        logger.info("Running PaddleOCR text extraction on %s page(s)", len(pages))
+        ocr = _get_paddle_ocr()
         results: list[OCRPageResult] = []
         issues: list[ProcessingIssue] = []
         for page in pages:
-            if self.paddleocr_tool is None:
-                native_items = _build_native_text_items(page)
-                issues.append(
-                    ProcessingIssue(
-                        code="ocr_unavailable",
-                        message="PaddleOCR is unavailable; using native text fallback when possible.",
-                        level="warning",
-                        page_number=page.page_number,
-                    )
-                )
-                results.append(
-                    OCRPageResult(
-                        page_number=page.page_number,
-                        width=page.width,
-                        height=page.height,
-                        items=native_items,
-                        text_source="native_text_fallback" if native_items else "unavailable",
-                        page_image_path=str(page.page_image_path),
-                    )
-                )
-                continue
             try:
-                blocks = self.paddleocr_tool.extract(page.page_image_path)
-            except RuntimeError as exc:
+                payload = ocr.predict(str(page.page_image_path))[0].json["res"]
+            except Exception as exc:
+                raise RuntimeError(
+                    "PaddleOCR text extraction failed. Make sure paddlepaddle, paddleocr, and paddlex[ocr] are installed."
+                ) from exc
+
+            items: list[OCRTextItem] = []
+            rec_texts = payload.get("rec_texts") or []
+            rec_scores = payload.get("rec_scores") or []
+            rec_boxes = payload.get("rec_boxes") or []
+            dt_polys = payload.get("dt_polys") or []
+            for index, text in enumerate(rec_texts, start=1):
+                cleaned = str(text).strip()
+                if not cleaned:
+                    continue
+                bbox = _bbox_from_ocr_payload(rec_boxes, dt_polys, index - 1)
+                if bbox is None or not bbox.is_valid():
+                    continue
+                score = rec_scores[index - 1] if index - 1 < len(rec_scores) else None
+                items.append(
+                    OCRTextItem(
+                        item_id=f"p{page.page_number}_ocr_{index}",
+                        page_number=page.page_number,
+                        text=cleaned,
+                        bbox=bbox,
+                        confidence=float(score) if score is not None else None,
+                        source="paddleocr",
+                    )
+                )
+
+            if not items:
                 issues.append(
                     ProcessingIssue(
-                        code="ocr_unavailable",
-                        message=str(exc),
+                        code="ocr_no_text",
+                        message="PaddleOCR did not return any text for this page.",
                         level="warning",
                         page_number=page.page_number,
                     )
                 )
-                blocks = []
-            items = [
-                OCRTextItem(
-                    item_id=f"p{page.page_number}_ocr_{index}",
-                    page_number=page.page_number,
-                    text=block.text,
-                    bbox=BoundingBox.from_list(block.bbox),
-                    confidence=block.confidence,
-                    source="paddleocr",
-                )
-                for index, block in enumerate(blocks, start=1)
-            ]
+
             results.append(
                 OCRPageResult(
                     page_number=page.page_number,
                     width=page.width,
                     height=page.height,
                     items=items,
-                    text_source="paddleocr",
+                    text_source="paddleocr_ppocrv5_mobile",
                     page_image_path=str(page.page_image_path),
                 )
             )
@@ -219,180 +185,91 @@ class OCRService:
 
 
 class ReadingOrderService:
-    def __init__(self) -> None:
-        self._layoutreader_module = None
-        self._layoutreader_error: str | None = None
-
     def resolve(self, pages: list[OCRPageResult]) -> tuple[dict[str, Any], list[ProcessingIssue]]:
         logger.info("Resolving reading order for %s OCR page(s)", len(pages))
-        issues: list[ProcessingIssue] = []
-        resolver = "geometric_fallback"
         ordered_text: list[dict[str, Any]] = []
         all_ids: list[str] = []
-        module = self._load_layoutreader()
-
         for page in pages:
-            ordered_items = None
-            if module is not None:
-                ordered_items = self._try_layoutreader(page.items, module)
-                if ordered_items is not None:
-                    resolver = "layoutreader"
-            if ordered_items is None:
-                ordered_items = sorted(page.items, key=lambda item: (round(item.bbox.y0 / 14.0), item.bbox.x0, item.bbox.y0))
+            ordered_items = sorted(page.items, key=_reading_order_key)
             for index, item in enumerate(ordered_items, start=1):
                 item.reading_order = index
             ids = [item.item_id for item in ordered_items]
             all_ids.extend(ids)
             ordered_text.append({"page_number": page.page_number, "ordered_item_ids": ids})
-
-        if module is None and self._layoutreader_error:
-            issues.append(
-                ProcessingIssue(
-                    code="reading_order_fallback",
-                    message="LayoutReader is unavailable; using deterministic geometric fallback.",
-                    level="warning",
-                    details={"import_error": self._layoutreader_error},
-                )
-            )
-
-        return {"resolver": resolver, "document_order_item_ids": all_ids, "pages": ordered_text}, issues
-
-    def _load_layoutreader(self):
-        if self._layoutreader_module is not None or self._layoutreader_error is not None:
-            return self._layoutreader_module
-        try:
-            import layoutreader  # type: ignore
-        except Exception as exc:
-            self._layoutreader_error = str(exc)
-            return None
-        self._layoutreader_module = layoutreader
-        return self._layoutreader_module
-
-    def _try_layoutreader(self, items: list[OCRTextItem], module) -> list[OCRTextItem] | None:
-        if not items:
-            return []
-        texts = [item.text for item in items]
-        boxes = [item.bbox.as_list() for item in items]
-        for attr in ("LayoutReader", "Reader", "Predictor"):
-            candidate = getattr(module, attr, None)
-            if candidate is None:
-                continue
-            try:
-                instance = candidate() if callable(candidate) else candidate
-            except Exception:
-                continue
-            for method_name in ("predict", "infer", "__call__", "sort_boxes"):
-                method = getattr(instance, method_name, None)
-                if method is None:
-                    continue
-                for kwargs in (
-                    {"texts": texts, "boxes": boxes},
-                    {"ocr_tokens": texts, "bboxes": boxes},
-                    {"tokens": texts, "boxes": boxes},
-                ):
-                    try:
-                        result = method(**kwargs)
-                    except Exception:
-                        continue
-                    ordered = _coerce_layoutreader_result(result, items)
-                    if ordered is not None:
-                        return ordered
-        return None
+        return {"resolver": "ocr_bbox_sort_v1", "document_order_item_ids": all_ids, "pages": ordered_text}, []
 
 
 class LayoutDetectionService:
-    def __init__(self) -> None:
-        self._ppstructure = None
-        self._ppstructure_error: str | None = None
-
     def detect(self, pages: list[PageContext], ocr_pages: list[OCRPageResult]) -> tuple[list[LayoutRegion], list[ProcessingIssue], str]:
-        logger.info("Running layout detection on %s page(s)", len(pages))
-        client = self._get_client()
-        if client is not None:
-            regions, issues = self._detect_with_paddle_layout(client, pages)
-            return regions, issues, "paddleocr_ppstructure"
-        issues = []
-        if self._ppstructure_error:
-            issues.append(
-                ProcessingIssue(
-                    code="layout_fallback",
-                    message="PaddleOCR layout detection unavailable; using heuristic fallback.",
-                    level="warning",
-                    details={"import_error": self._ppstructure_error},
-                )
-            )
-        return self._detect_with_fallback(ocr_pages), issues, "heuristic_layout"
-
-    def _get_client(self):
-        if self._ppstructure is not None or self._ppstructure_error is not None:
-            return self._ppstructure
-        try:
-            from paddleocr import PPStructure  # type: ignore
-        except Exception as exc:
-            self._ppstructure_error = str(exc)
-            return None
-        self._ppstructure = PPStructure(show_log=False)
-        return self._ppstructure
-
-    def _detect_with_paddle_layout(self, client, pages: list[PageContext]) -> tuple[list[LayoutRegion], list[ProcessingIssue]]:
-        issues: list[ProcessingIssue] = []
+        del ocr_pages
+        logger.info("Running Paddle layout detection on %s page(s)", len(pages))
+        layout_detector = _get_paddle_layout_detector()
         regions: list[LayoutRegion] = []
+        issues: list[ProcessingIssue] = []
         next_id = 1
+        type_counts = {"text_block": 0, "table": 0, "figure": 0}
+
         for page in pages:
             try:
-                results = client(str(page.page_image_path)) or []
+                payload = layout_detector.predict(str(page.page_image_path))[0].json["res"]
             except Exception as exc:
-                issues.append(
-                    ProcessingIssue(
-                        code="layout_detection_failed",
-                        message=f"Layout detection failed on page {page.page_number}.",
-                        level="warning",
-                        page_number=page.page_number,
-                        details={"error": str(exc)},
-                    )
-                )
-                results = []
-            for item in results:
-                raw_type = str(item.get("type", "")).lower()
-                normalized = _normalize_region_type(raw_type)
-                bbox = item.get("bbox") or item.get("box")
-                if normalized is None or not bbox or len(bbox) != 4:
-                    continue
-                regions.append(
-                    LayoutRegion(
-                        region_id=f"region_{next_id}",
-                        region_type=normalized,
-                        page_number=page.page_number,
-                        bbox=BoundingBox.from_list([float(value) for value in bbox]),
-                        confidence=float(item.get("score", 0.0) or 0.0),
-                        source="paddleocr_layout",
-                        metadata={"raw_type": raw_type, "normalized_from": raw_type},
-                    )
-                )
-                next_id += 1
-        return _dedupe_regions(regions), issues
+                raise RuntimeError(
+                    "Paddle layout detection failed. Make sure paddlepaddle, paddleocr, and paddlex[ocr] are installed."
+                ) from exc
 
-    def _detect_with_fallback(self, ocr_pages: list[OCRPageResult]) -> list[LayoutRegion]:
-        regions: list[LayoutRegion] = []
-        next_id = 1
-        for page in ocr_pages:
-            for item in page.items:
-                # Without a real layout detector, OCR/native text items are not reliable visual regions.
-                # Keep the fallback conservative so we do not create bogus table/chart crops.
-                region_type = "text_block"
-                regions.append(
-                    LayoutRegion(
-                        region_id=f"region_{next_id}",
-                        region_type=region_type,
-                        page_number=page.page_number,
-                        bbox=item.bbox,
-                        confidence=item.confidence,
-                        source="heuristic_layout",
-                        metadata={"ocr_item_id": item.item_id},
-                    )
+            page_regions: list[LayoutRegion] = []
+            skipped_labels: dict[str, int] = {}
+            for box in payload.get("boxes") or []:
+                label = str(box.get("label") or "").strip().lower()
+                region_type = _region_type_for_label(label)
+                if region_type is None:
+                    skipped_labels[label or "unknown"] = skipped_labels.get(label or "unknown", 0) + 1
+                    continue
+                bbox = _bbox_from_layout_box(box.get("coordinate"))
+                if bbox is None or not bbox.is_valid():
+                    continue
+                region = LayoutRegion(
+                    region_id=f"region_{next_id}",
+                    region_type=region_type,
+                    page_number=page.page_number,
+                    bbox=bbox,
+                    confidence=float(box.get("score")) if box.get("score") is not None else None,
+                    source="paddle_layout_detection",
+                    metadata={
+                        "detector": "PP-DocLayout_plus-L",
+                        "label": label,
+                    },
                 )
+                page_regions.append(region)
+                type_counts[region_type] += 1
                 next_id += 1
-        return _dedupe_regions(regions)
+
+            logger.info(
+                "Page %s layout regions: text_blocks=%s tables=%s figures=%s skipped=%s",
+                page.page_number,
+                sum(1 for region in page_regions if region.region_type == "text_block"),
+                sum(1 for region in page_regions if region.region_type == "table"),
+                sum(1 for region in page_regions if region.region_type == "figure"),
+                skipped_labels,
+            )
+            regions.extend(page_regions)
+
+        if not regions:
+            issues.append(
+                ProcessingIssue(
+                    code="layout_no_regions",
+                    message="Paddle layout detection did not return any supported regions.",
+                    level="warning",
+                )
+            )
+
+        logger.info(
+            "Paddle layout detection created %s text block(s), %s table(s), and %s figure(s)",
+            type_counts["text_block"],
+            type_counts["table"],
+            type_counts["figure"],
+        )
+        return _dedupe_regions(regions), issues, "PP-DocLayout_plus-L"
 
 
 class AssociationService:
@@ -404,8 +281,11 @@ class AssociationService:
     ) -> tuple[list[RegionAssociation], list[OrderedTextBlock], dict[str, Any]]:
         item_lookup = {item.item_id: item for page in ocr_pages for item in page.items}
         regions_by_page: dict[int, list[LayoutRegion]] = {}
+        text_regions_by_page: dict[int, list[LayoutRegion]] = {}
         for region in regions:
             regions_by_page.setdefault(region.page_number, []).append(region)
+            if region.region_type == "text_block":
+                text_regions_by_page.setdefault(region.page_number, []).append(region)
 
         associations: list[RegionAssociation] = []
         ordered_blocks: list[OrderedTextBlock] = []
@@ -416,54 +296,59 @@ class AssociationService:
             page_number = int(page_entry["page_number"])
             ordered_items = [item_lookup[item_id] for item_id in page_entry.get("ordered_item_ids", []) if item_id in item_lookup]
             page_regions = regions_by_page.get(page_number, [])
+            page_text_regions = text_regions_by_page.get(page_number, [])
             page_blocks: list[OrderedTextBlock] = []
             current_items: list[OCRTextItem] = []
             current_region_id: str | None = None
             current_line_bucket: int | None = None
 
             for item in ordered_items:
-                matched, overlap_ratio = _best_region_match(item, page_regions)
-                item.region_id = matched.region_id if matched else None
-                line_bucket = int(item.bbox.y0 // 18)
-                if current_items and (item.region_id != current_region_id or line_bucket != current_line_bucket):
-                    block = _build_block(page_number, current_items, global_index)
-                    page_blocks.append(block)
-                    ordered_blocks.append(block)
-                    for grouped_item in current_items:
-                        grouped_item.block_id = block.block_id
-                    global_index += 1
-                    current_items = []
-                current_items.append(item)
-                current_region_id = item.region_id
-                current_line_bucket = line_bucket
+                matched_region, overlap_ratio = _best_region_match(item, page_regions)
+                item.region_id = matched_region.region_id if matched_region else None
+                line_bucket = int(item.bbox.y0 // 20)
                 associations.append(
                     RegionAssociation(
                         association_id=f"assoc_{len(associations) + 1}",
                         page_number=page_number,
                         item_id=item.item_id,
                         region_id=item.region_id,
-                        region_type=matched.region_type if matched else None,
+                        region_type=matched_region.region_type if matched_region else None,
                         overlap_ratio=round(overlap_ratio, 4),
                     )
                 )
-            if current_items:
-                block = _build_block(page_number, current_items, global_index)
-                page_blocks.append(block)
-                ordered_blocks.append(block)
-                for grouped_item in current_items:
-                    grouped_item.block_id = block.block_id
-                global_index += 1
 
-            association_lookup = {association.item_id: association for association in associations if association.page_number == page_number}
-            for block in page_blocks:
-                for item_id in block.item_ids:
-                    association_lookup[item_id].block_id = block.block_id
+                group_region_id = item.region_id
+                if current_items and (group_region_id != current_region_id or line_bucket != current_line_bucket):
+                    global_index = _flush_block(page_number, current_items, global_index, page_blocks, ordered_blocks)
+                    current_items = []
+
+                current_items.append(item)
+                current_region_id = group_region_id
+                current_line_bucket = line_bucket
+
+            if current_items:
+                global_index = _flush_block(page_number, current_items, global_index, page_blocks, ordered_blocks)
+
+            if not page_blocks and ordered_items:
+                logger.warning("Page %s had OCR text but no Paddle text blocks; falling back to OCR line grouping", page_number)
+                page_blocks = _build_fallback_blocks(page_number, ordered_items, global_index)
+                ordered_blocks.extend(page_blocks)
+                global_index += len(page_blocks)
+                for block in page_blocks:
+                    for item_id in block.item_ids:
+                        item_lookup[item_id].block_id = block.block_id
+            else:
+                association_lookup = {assoc.item_id: assoc for assoc in associations if assoc.page_number == page_number}
+                for block in page_blocks:
+                    for item_id in block.item_ids:
+                        association_lookup[item_id].block_id = block.block_id
 
             page_payloads.append(
                 {
                     "page_number": page_number,
                     "blocks": [block.model_dump(mode="json") for block in page_blocks],
                     "text": "\n".join(block.text for block in page_blocks if block.text.strip()).strip(),
+                    "text_region_count": len(page_text_regions),
                 }
             )
 
@@ -494,24 +379,13 @@ class CroppingService:
             ]
 
         page_lookup = {page.page_number: page for page in pages}
-        for folder in ("tables", "charts", "text_blocks"):
+        for folder in ("tables", "figures"):
             (output_dir / folder).mkdir(parents=True, exist_ok=True)
 
         assets: list[CroppedRegionAsset] = []
         issues: list[ProcessingIssue] = []
         for region in regions:
-            if region.region_type not in {"table", "chart"}:
-                continue
-            if not region.bbox.is_valid():
-                issues.append(
-                    ProcessingIssue(
-                        code="invalid_crop_bbox",
-                        message="Skipping crop because the region bounding box is invalid.",
-                        level="warning",
-                        page_number=region.page_number,
-                        details={"region_id": region.region_id, "bbox": region.bbox.as_list()},
-                    )
-                )
+            if region.region_type not in {"table", "figure"}:
                 continue
             page = page_lookup.get(region.page_number)
             if page is None or not page.page_image_path.exists():
@@ -524,34 +398,25 @@ class CroppingService:
                         details={"region_id": region.region_id},
                     )
                 )
+                logger.info("Skipping crop for %s because page image is missing", region.region_id)
                 continue
-            if page.page_image_path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}:
-                issues.append(
-                    ProcessingIssue(
-                        code="missing_page_raster",
-                        message="Skipping crop because no rendered page image is available for this region.",
-                        level="warning",
-                        page_number=region.page_number,
-                        details={"region_id": region.region_id, "page_image_path": str(page.page_image_path)},
-                    )
-                )
-                continue
-            folder = "charts" if region.region_type == "chart" else "tables"
+
+            folder = "tables" if region.region_type == "table" else "figures"
             crop_path = output_dir / folder / f"{region.region_id}.png"
             try:
                 with Image.open(page.page_image_path) as image:
-                    x0, y0, x1, y1 = [int(value) for value in region.bbox.as_list()]
-                    crop_box = (max(0, x0), max(0, y0), min(image.width, x1), min(image.height, y1))
-                    if crop_box[0] >= crop_box[2] or crop_box[1] >= crop_box[3]:
+                    crop_box = _compute_crop_box(region, image.width, image.height)
+                    if crop_box is None:
                         issues.append(
                             ProcessingIssue(
                                 code="invalid_crop_bounds",
-                                message="Skipping crop because the scaled crop bounds are empty.",
+                                message="Skipping crop because the padded crop bounds are invalid.",
                                 level="warning",
                                 page_number=region.page_number,
-                                details={"region_id": region.region_id, "crop_box": list(crop_box)},
+                                details={"region_id": region.region_id},
                             )
                         )
+                        logger.info("Skipping crop for %s because crop bounds were invalid", region.region_id)
                         continue
                     image.crop(crop_box).save(crop_path)
             except Exception as exc:
@@ -564,7 +429,9 @@ class CroppingService:
                         details={"region_id": region.region_id, "error": str(exc)},
                     )
                 )
+                logger.info("Skipping crop for %s because saving failed: %s", region.region_id, exc)
                 continue
+
             region.crop_path = str(crop_path)
             assets.append(
                 CroppedRegionAsset(
@@ -576,6 +443,7 @@ class CroppingService:
                     bbox=region.bbox,
                 )
             )
+            logger.info("Saved %s crop for %s to %s", region.region_type, region.region_id, crop_path)
         return assets, issues
 
 
@@ -592,6 +460,7 @@ def build_chunks(
     regions_by_id = {region.region_id: region for region in regions}
     for block in ordered_blocks:
         blocks_by_page.setdefault(block.page_number, []).append(block)
+
     chunks: list[ProcessedChunk] = []
     next_index = 1
     for page_number, blocks in sorted(blocks_by_page.items()):
@@ -608,68 +477,6 @@ def build_chunks(
     return chunks
 
 
-def build_agent_input(*, ordered_text: dict[str, Any], regions: list[LayoutRegion]) -> AgentInput:
-    page_text_by_number = {
-        int(page["page_number"]): str(page.get("text", ""))
-        for page in ordered_text.get("pages", [])
-        if isinstance(page, dict)
-    }
-
-    def _region_payload(region: LayoutRegion) -> dict[str, Any]:
-        return {
-            "region_id": region.region_id,
-            "region_type": region.region_type,
-            "page_number": region.page_number,
-            "bbox": region.bbox.as_list(),
-            "crop_path": region.crop_path,
-            "context_text": page_text_by_number.get(region.page_number, "")[:500],
-        }
-
-    return AgentInput(
-        ordered_ocr_text=str(ordered_text.get("full_text", "")),
-        layout_regions=[_region_payload(region) for region in regions],
-        available_tools=TOOL_DESCRIPTORS,
-        crop_references=[
-            _region_payload(region) for region in regions if region.crop_path and region.region_type in {"chart", "table"}
-        ],
-    )
-
-
-class LangChainAgentService:
-    def __init__(self, settings: Settings) -> None:
-        self.settings = settings
-
-    def run(self, agent_input: AgentInput) -> AgentExecutionResult:
-        logger.info("Running OpenAI-backed agent with %s cropped visual region(s)", len(agent_input.crop_references))
-        tool_results: list[dict[str, Any]] = []
-        repair_client = build_agent_repair_client(self.settings)
-        summary = repair_client.generate_structured(
-            system_prompt=SYSTEM_PROMPT,
-            user_prompt=_build_agent_summary_prompt(agent_input, tool_results),
-            response_model=AgentAnalysisResult,
-        ).model_copy(
-            update={
-                "tool_calls": [_normalize_tool_call(call) for call in tool_results],
-                "tables_analyzed": _collect_table_outputs(tool_results),
-                "charts_analyzed": _collect_chart_outputs(tool_results),
-                "ordered_ocr_text_excerpt": agent_input.ordered_ocr_text[:500],
-            }
-        )
-        validated_summary, validation_issue = _validate_agent_output(
-            raw_output=summary.model_dump(mode="json"),
-            agent_input=agent_input,
-            tool_results=tool_results,
-        )
-        issues: list[ProcessingIssue] = [validation_issue] if validation_issue is not None else []
-
-        return AgentExecutionResult(
-            tool_results=tool_results,
-            summary=validated_summary,
-            model_name=self.settings.agent_llm_model,
-            issues=issues,
-        )
-
-
 def build_document_artifacts(
     *,
     loaded: LoadedDocument,
@@ -678,8 +485,6 @@ def build_document_artifacts(
     regions: list[LayoutRegion],
     cropped_assets: list[CroppedRegionAsset],
     chunks: list[ProcessedChunk],
-    agent_input: AgentInput,
-    agent_result: AgentExecutionResult,
     reading_order_model: str,
     layout_detection_model: str,
     issues: list[ProcessingIssue],
@@ -699,7 +504,9 @@ def build_document_artifacts(
                 "page_number": region.page_number,
                 "bbox": region.bbox.as_list(),
                 "crop_path": region.crop_path,
-                "normalized_from": region.metadata.get("normalized_from", region.metadata.get("raw_type")),
+                "detector": region.metadata.get("detector"),
+                "label": region.metadata.get("label"),
+                "confidence": region.confidence,
             }
             for region in regions
         ],
@@ -711,16 +518,16 @@ def build_document_artifacts(
             "cropped_asset_count": len(cropped_assets),
             "chunk_count": len(chunks),
         },
-        agent_input=agent_input.model_dump(mode="json"),
-        agent_output=agent_result.summary.model_dump(mode="json"),
+        agent_input={},
+        agent_output={},
     )
     metadata = ProcessingMetadata(
         processing_timestamp=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        schema_version="3.0.0",
-        ocr_engine="paddleocr",
+        schema_version="6.0.0",
+        ocr_engine="PaddleOCR",
         reading_order_model=reading_order_model,
         layout_detection_model=layout_detection_model,
-        agent_model=agent_result.model_name,
+        agent_model=None,
         confidence_summary=_confidence_summary(ocr_pages=ocr_pages, regions=regions, chunks=chunks),
         warnings=warnings,
         errors=errors,
@@ -728,44 +535,220 @@ def build_document_artifacts(
     return document, metadata
 
 
+def build_visual_summaries(
+    *,
+    regions: list[LayoutRegion],
+    ordered_blocks: list[OrderedTextBlock],
+    chunks: list[ProcessedChunk],
+    cropped_assets: list[CroppedRegionAsset],
+) -> list[VisualRegionSummary]:
+    asset_by_region = {asset.region_id: asset for asset in cropped_assets}
+    chunks_by_region: dict[str, list[ProcessedChunk]] = {}
+    for chunk in chunks:
+        for region_id in chunk.source_region_ids:
+            chunks_by_region.setdefault(region_id, []).append(chunk)
+
+    summaries: list[VisualRegionSummary] = []
+    for region in regions:
+        if region.region_type not in {"table", "figure"}:
+            continue
+        page_blocks = [block for block in ordered_blocks if block.page_number == region.page_number and block.bbox is not None]
+        overlapping_blocks = [
+            block
+            for block in page_blocks
+            if block.bbox is not None and block.bbox.intersection_area(region.bbox) > 0
+        ]
+        if not overlapping_blocks:
+            overlapping_blocks = sorted(
+                page_blocks,
+                key=lambda block: min(
+                    abs(block.bbox.y0 - region.bbox.y1),  # type: ignore[union-attr]
+                    abs(block.bbox.y1 - region.bbox.y0),  # type: ignore[union-attr]
+                ),
+            )[:3]
+        region_chunks = chunks_by_region.get(region.region_id, [])
+        block_text = " ".join(block.text for block in overlapping_blocks if block.text.strip()).strip()
+        chunk_text = " ".join(chunk.text for chunk in region_chunks if chunk.text.strip()).strip()
+        summary_text = (block_text or chunk_text or f"Detected {region.region_type} region on page {region.page_number}.")[:1200]
+        asset = asset_by_region.get(region.region_id)
+        summaries.append(
+            VisualRegionSummary(
+                summary_id=f"summary_{region.region_id}",
+                region_id=region.region_id,
+                asset_id=asset.asset_id if asset else None,
+                page_number=region.page_number,
+                region_type=region.region_type,
+                crop_path=asset.crop_path if asset else region.crop_path,
+                linked_block_ids=[block.block_id for block in overlapping_blocks],
+                linked_chunk_ids=[chunk.chunk_id for chunk in region_chunks],
+                summary_text=summary_text,
+                metadata={
+                    "label": region.metadata.get("label"),
+                    "detector": region.metadata.get("detector"),
+                },
+            )
+        )
+    return summaries
+
+
 def export_artifacts(
     *,
     working_dir: Path,
+    loaded: LoadedDocument,
     raw_ocr: list[OCRPageResult],
     reading_order: dict[str, Any],
     ordered_text: dict[str, Any],
     regions: list[LayoutRegion],
     region_associations: list[RegionAssociation],
     cropped_assets: list[CroppedRegionAsset],
+    visual_summaries: list[VisualRegionSummary],
     chunks: list[ProcessedChunk],
     document: ProcessedDocument,
     metadata: ProcessingMetadata,
 ) -> Path:
-    ocr_dir = working_dir / "ocr"
-    order_dir = working_dir / "order"
-    layout_dir = working_dir / "layout"
     crops_dir = working_dir / "crops"
-    for directory in (ocr_dir, order_dir, layout_dir, crops_dir):
-        directory.mkdir(parents=True, exist_ok=True)
-    _write_json(ocr_dir / "raw_ocr.json", [page.model_dump(mode="json") for page in raw_ocr])
-    _write_json(order_dir / "reading_order.json", reading_order)
-    _write_json(order_dir / "ordered_text.json", ordered_text)
-    _write_json(layout_dir / "regions.json", [region.model_dump(mode="json") for region in regions])
-    _write_json(layout_dir / "region_associations.json", [assoc.model_dump(mode="json") for assoc in region_associations])
-    _write_json(crops_dir / "cropped_assets.json", [asset.model_dump(mode="json") for asset in cropped_assets])
+    crops_dir.mkdir(parents=True, exist_ok=True)
+    manifest = ProcessedManifest(
+        schema_version=metadata.schema_version,
+        pipeline_stage="preprocessing",
+        processing_status="completed",
+        document_id=loaded.document_id,
+        source_filename=loaded.original_copy_path.name,
+        source_path=str(loaded.original_copy_path),
+        working_dir=str(working_dir),
+        page_count=len(loaded.pages),
+        chunk_count=len(chunks),
+        processing_timestamp=metadata.processing_timestamp,
+        artifacts={
+            "document": "document.json",
+            "ocr": "ocr.json",
+            "layout": "layout.json",
+            "reading_order": "reading_order.json",
+            "cropped_assets": "cropped_assets.json",
+            "visual_summaries": "visual_summaries.json",
+            "chunks": "chunks.json",
+            "metadata": "metadata.json",
+        },
+    )
+    _write_json(working_dir / "manifest.json", manifest.model_dump(mode="json"))
+    _write_json(working_dir / "ocr.json", [page.model_dump(mode="json") for page in raw_ocr])
+    _write_json(
+        working_dir / "reading_order.json",
+        {
+            "reading_order": reading_order,
+            "ordered_text": ordered_text,
+        },
+    )
+    _write_json(
+        working_dir / "layout.json",
+        {
+            "regions": [region.model_dump(mode="json") for region in regions],
+            "associations": [assoc.model_dump(mode="json") for assoc in region_associations],
+        },
+    )
+    _write_json(working_dir / "cropped_assets.json", [asset.model_dump(mode="json") for asset in cropped_assets])
+    _write_json(working_dir / "visual_summaries.json", [summary.model_dump(mode="json") for summary in visual_summaries])
     _write_json(working_dir / "document.json", document.model_dump(mode="json"))
     _write_json(working_dir / "chunks.json", [chunk.model_dump(mode="json") for chunk in chunks])
     _write_json(working_dir / "metadata.json", metadata.model_dump(mode="json"))
     return working_dir / "document.json"
 
 
-def _normalize_region_type(raw_type: str) -> str | None:
-    if raw_type == "table":
+def _load_pdf_pages(path: Path, pages_dir: Path, *, render_scale: float) -> list[PageContext]:
+    try:
+        import pypdfium2 as pdfium  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("PDF rendering requires pypdfium2.") from exc
+
+    pdf = pdfium.PdfDocument(str(path))
+    pages: list[PageContext] = []
+    try:
+        for page_index in range(len(pdf)):
+            page_number = page_index + 1
+            pdfium_page = pdf[page_index]
+            bitmap = pdfium_page.render(scale=render_scale)
+            image = bitmap.to_pil()
+            image_path = pages_dir / f"page_{page_number}.png"
+            image.save(image_path)
+            width, height = image.size
+            pages.append(
+                PageContext(
+                    page_number=page_number,
+                    width=float(width),
+                    height=float(height),
+                    page_image_path=image_path,
+                )
+            )
+    finally:
+        pdf.close()
+    return pages
+
+
+def _load_image_page(path: Path, *, page_number: int) -> PageContext:
+    try:
+        from PIL import Image  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("Image input requires Pillow.") from exc
+
+    with Image.open(path) as image:
+        width, height = image.size
+    return PageContext(page_number=page_number, width=float(width), height=float(height), page_image_path=path)
+
+
+@lru_cache(maxsize=1)
+def _get_paddle_ocr() -> Any:
+    _configure_paddle_env()
+    from paddleocr import PaddleOCR
+
+    return PaddleOCR(
+        use_doc_orientation_classify=False,
+        use_doc_unwarping=False,
+        use_textline_orientation=False,
+        text_detection_model_name="PP-OCRv5_mobile_det",
+        text_recognition_model_name="PP-OCRv5_mobile_rec",
+    )
+
+
+@lru_cache(maxsize=1)
+def _get_paddle_layout_detector() -> Any:
+    _configure_paddle_env()
+    from paddleocr import LayoutDetection
+
+    return LayoutDetection()
+
+
+def _bbox_from_ocr_payload(rec_boxes: list[Any], dt_polys: list[Any], index: int) -> BoundingBox | None:
+    if index < len(rec_boxes):
+        value = rec_boxes[index]
+        if isinstance(value, list) and len(value) == 4:
+            return BoundingBox.from_list([float(item) for item in value])
+    if index < len(dt_polys):
+        points = dt_polys[index]
+        if isinstance(points, list) and points:
+            xs = [float(point[0]) for point in points]
+            ys = [float(point[1]) for point in points]
+            return BoundingBox(x0=min(xs), y0=min(ys), x1=max(xs), y1=max(ys))
+    return None
+
+
+def _bbox_from_layout_box(value: Any) -> BoundingBox | None:
+    if not isinstance(value, list) or len(value) != 4:
+        return None
+    return BoundingBox.from_list([float(item) for item in value])
+
+
+def _reading_order_key(item: OCRTextItem) -> tuple[int, float, float]:
+    line_bucket = round(item.bbox.y0 / 18.0)
+    return (line_bucket, item.bbox.x0, item.bbox.y0)
+
+
+def _region_type_for_label(label: str) -> str | None:
+    if label == "table" or "table" in label:
         return "table"
-    if raw_type in {"figure", "chart", "image"}:
-        return "chart"
-    if raw_type in {"text", "title", "list"}:
+    if label in TEXT_BLOCK_LABELS or label.endswith("_text"):
         return "text_block"
+    if label in FIGURE_LABELS:
+        return "figure"
     return None
 
 
@@ -773,26 +756,12 @@ def _dedupe_regions(regions: list[LayoutRegion]) -> list[LayoutRegion]:
     seen: set[tuple[int, str, tuple[float, float, float, float]]] = set()
     deduped: list[LayoutRegion] = []
     for region in regions:
-        key = (region.page_number, region.region_type, tuple(round(value, 2) for value in region.bbox.as_list()))
+        key = (region.page_number, region.region_type, tuple(round(value, 1) for value in region.bbox.as_list()))
         if key in seen:
             continue
         seen.add(key)
         deduped.append(region)
     return deduped
-
-
-def _coerce_layoutreader_result(result: Any, items: list[OCRTextItem]) -> list[OCRTextItem] | None:
-    if isinstance(result, dict) and "order" in result:
-        result = result["order"]
-    if not isinstance(result, list):
-        return None
-    if result and all(isinstance(value, int) for value in result) and all(0 <= value < len(items) for value in result):
-        return [items[index] for index in result]
-    if result and all(isinstance(value, str) for value in result):
-        lookup = {item.item_id: item for item in items}
-        if all(value in lookup for value in result):
-            return [lookup[value] for value in result]
-    return None
 
 
 def _best_region_match(item: OCRTextItem, regions: list[LayoutRegion]) -> tuple[LayoutRegion | None, float]:
@@ -808,6 +777,45 @@ def _best_region_match(item: OCRTextItem, regions: list[LayoutRegion]) -> tuple[
             best = region
             best_ratio = ratio
     return best, best_ratio
+
+
+def _flush_block(
+    page_number: int,
+    current_items: list[OCRTextItem],
+    global_index: int,
+    page_blocks: list[OrderedTextBlock],
+    ordered_blocks: list[OrderedTextBlock],
+) -> int:
+    block = _build_block(page_number, current_items, global_index)
+    for item in current_items:
+        item.block_id = block.block_id
+    page_blocks.append(block)
+    ordered_blocks.append(block)
+    return global_index + 1
+
+
+def _build_fallback_blocks(page_number: int, ordered_items: list[OCRTextItem], start_index: int) -> list[OrderedTextBlock]:
+    blocks: list[OrderedTextBlock] = []
+    current_items: list[OCRTextItem] = []
+    current_line_bucket: int | None = None
+    next_index = start_index
+    for item in ordered_items:
+        line_bucket = int(item.bbox.y0 // 20)
+        if current_items and line_bucket != current_line_bucket:
+            block = _build_block(page_number, current_items, next_index)
+            for grouped_item in current_items:
+                grouped_item.block_id = block.block_id
+            blocks.append(block)
+            next_index += 1
+            current_items = []
+        current_items.append(item)
+        current_line_bucket = line_bucket
+    if current_items:
+        block = _build_block(page_number, current_items, next_index)
+        for grouped_item in current_items:
+            grouped_item.block_id = block.block_id
+        blocks.append(block)
+    return blocks
 
 
 def _build_block(page_number: int, items: list[OCRTextItem], reading_order: int) -> OrderedTextBlock:
@@ -834,6 +842,7 @@ def _build_chunk(
     text = "\n\n".join(block.text for block in blocks if block.text.strip()).strip()
     region_ids = sorted({region_id for block in blocks for region_id in block.region_ids})
     crop_refs = [regions_by_id[region_id].crop_path for region_id in region_ids if region_id in regions_by_id and regions_by_id[region_id].crop_path]
+    crop_asset_ids = [f"asset_{region_id}" for region_id in region_ids if region_id in regions_by_id and regions_by_id[region_id].crop_path]
     region_types = sorted({regions_by_id[region_id].region_type for region_id in region_ids if region_id in regions_by_id})
     bbox_refs = [block.bbox.as_list() for block in blocks if block.bbox is not None]
     item_ids = [item_id for block in blocks for item_id in block.item_ids]
@@ -849,6 +858,7 @@ def _build_chunk(
         "region_types": region_types,
         "bbox_references": bbox_refs,
         "crop_references": crop_refs,
+        "crop_asset_ids": crop_asset_ids,
     }
     return ProcessedChunk(
         chunk_id=chunk_id,
@@ -878,6 +888,30 @@ def _overlap_blocks(blocks: list[OrderedTextBlock], overlap_chars: int) -> list[
     return kept
 
 
+def _compute_crop_box(region: LayoutRegion, image_width: int, image_height: int) -> tuple[int, int, int, int] | None:
+    width = region.bbox.x1 - region.bbox.x0
+    height = region.bbox.y1 - region.bbox.y0
+    if width <= 1 or height <= 1:
+        logger.info("Skipping crop for %s because bbox was empty", region.region_id)
+        return None
+
+    if region.region_type == "table":
+        pad_x = max(28, int(width * 0.05))
+        pad_y = max(28, int(height * 0.08))
+    else:
+        pad_x = max(36, int(width * 0.08))
+        pad_y = max(36, int(height * 0.12))
+
+    left = max(0, int(region.bbox.x0 - pad_x))
+    top = max(0, int(region.bbox.y0 - pad_y))
+    right = min(image_width, int(region.bbox.x1 + pad_x))
+    bottom = min(image_height, int(region.bbox.y1 + pad_y))
+    if right - left < 48 or bottom - top < 48:
+        logger.info("Skipping crop for %s because padded crop was too small", region.region_id)
+        return None
+    return (left, top, right, bottom)
+
+
 def _write_json(path: Path, payload: object) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
@@ -893,309 +927,3 @@ def _confidence_summary(*, ocr_pages: list[OCRPageResult], regions: list[LayoutR
         "chunk_count": len(chunks),
     }
 
-
-def _validate_agent_output(
-    *,
-    raw_output: Any,
-    agent_input: AgentInput,
-    tool_results: list[dict[str, Any]],
-) -> tuple[AgentAnalysisResult, ProcessingIssue | None]:
-    parsed = None
-    if isinstance(raw_output, dict):
-        parsed = raw_output
-    elif isinstance(raw_output, str):
-        cleaned = raw_output.strip()
-        try:
-            parsed = json.loads(cleaned)
-        except json.JSONDecodeError:
-            start = cleaned.find("{")
-            end = cleaned.rfind("}")
-            if start >= 0 and end > start:
-                try:
-                    parsed = json.loads(cleaned[start : end + 1])
-                except json.JSONDecodeError:
-                    parsed = None
-
-    if isinstance(parsed, dict):
-        try:
-            return AgentAnalysisResult.model_validate(
-                {
-                    **parsed,
-                    "tool_calls": [_normalize_tool_call(call) for call in tool_results],
-                    "tables_analyzed": _collect_table_outputs(tool_results),
-                    "charts_analyzed": _collect_chart_outputs(tool_results),
-                    "ordered_ocr_text_excerpt": parsed.get("ordered_ocr_text_excerpt") or agent_input.ordered_ocr_text[:500],
-                }
-            ), None
-        except Exception as exc:
-            raise RuntimeError(f"Agent output validation failed: {exc}") from exc
-
-    raise RuntimeError("Agent output was not valid structured JSON.")
-
-
-def _normalize_tool_call(raw_call: dict[str, Any]) -> AgentToolCall:
-    tool_name = str(raw_call.get("tool_name") or "")
-    if tool_name not in {"AnalyzeChartTool", "AnalyzeTableTool"}:
-        tool_name = "AnalyzeChartTool" if "chart" in tool_name.lower() else "AnalyzeTableTool"
-    region_id = ""
-    tool_input = raw_call.get("tool_input")
-    if isinstance(tool_input, dict):
-        region_id = str(tool_input.get("region_id") or "")
-    observation = raw_call.get("observation")
-    return AgentToolCall(
-        tool_name=tool_name,
-        region_id=region_id,
-        tool_input=tool_input if isinstance(tool_input, dict) else {"raw": tool_input},
-        observation=observation if isinstance(observation, dict) else {"raw": observation},
-    )
-
-
-def _collect_chart_outputs(tool_results: list[dict[str, Any]]) -> list[ChartAnalysisOutput]:
-    outputs: list[ChartAnalysisOutput] = []
-    for call in tool_results:
-        if call.get("tool_name") != "AnalyzeChartTool":
-            continue
-        observation = call.get("observation")
-        if isinstance(observation, dict):
-            try:
-                outputs.append(ChartAnalysisOutput.model_validate(observation))
-            except Exception:
-                continue
-    return outputs
-
-
-def _collect_table_outputs(tool_results: list[dict[str, Any]]) -> list[TableAnalysisOutput]:
-    outputs: list[TableAnalysisOutput] = []
-    for call in tool_results:
-        if call.get("tool_name") != "AnalyzeTableTool":
-            continue
-        observation = call.get("observation")
-        if isinstance(observation, dict):
-            try:
-                outputs.append(TableAnalysisOutput.model_validate(observation))
-            except Exception:
-                continue
-    return outputs
-
-
-def _build_agent_summary_prompt(agent_input: AgentInput, tool_results: list[dict[str, Any]]) -> str:
-    return (
-        "Ordered OCR text:\n"
-        f"{agent_input.ordered_ocr_text}\n\n"
-        "Layout regions:\n"
-        f"{json.dumps(agent_input.layout_regions, ensure_ascii=False, indent=2)}\n\n"
-        "Available tools:\n"
-        f"{json.dumps(agent_input.available_tools, ensure_ascii=False, indent=2)}\n\n"
-        "Cropped visual regions:\n"
-        f"{json.dumps(agent_input.crop_references, ensure_ascii=False, indent=2)}\n\n"
-        "Tool results:\n"
-        f"{json.dumps(tool_results, ensure_ascii=False, indent=2)}\n\n"
-        "Use the tool results when present, answer only from the provided document content, and return valid JSON."
-    )
-
-
-def _build_native_pdf_tool(settings: Settings):
-    try:
-        from tools.native_pdf import NativePDFTool  # type: ignore
-    except Exception:
-        return None
-    return NativePDFTool(min_text_chars=settings.min_pdf_text_chars)
-
-
-def _build_paddleocr_tool(*, language: str):
-    try:
-        from tools.paddleocr import PaddleOCRTool  # type: ignore
-    except Exception:
-        return None
-    return PaddleOCRTool(language=language)
-
-
-def _load_pdf_with_system_pdfkit(path: Path, pages_dir: Path) -> list[PageContext]:
-    try:
-        import objc
-        from Foundation import NSURL
-        from AppKit import NSBitmapImageRep, NSPNGFileType
-    except Exception:
-        return []
-
-    module_globals: dict[str, Any] = {}
-    try:
-        objc.loadBundle("PDFKit", module_globals, bundle_path="/System/Library/Frameworks/PDFKit.framework")
-        PDFDocument = module_globals["PDFDocument"]
-    except Exception:
-        return []
-
-    url = NSURL.fileURLWithPath_(str(path))
-    document = PDFDocument.alloc().initWithURL_(url)
-    if document is None:
-        return []
-
-    pages: list[PageContext] = []
-    for page_index in range(int(document.pageCount())):
-        page = document.pageAtIndex_(page_index)
-        if page is None:
-            continue
-        page_number = page_index + 1
-        page_text = str(page.string() or "").strip()
-        bounds = page.boundsForBox_(0)
-        image_path = pages_dir / f"page_{page_number}.png"
-        thumbnail = page.thumbnailOfSize_forBox_((900, 1200), 0)
-        if thumbnail is not None:
-            rep = NSBitmapImageRep.alloc().initWithData_(thumbnail.TIFFRepresentation())
-            png_data = rep.representationUsingType_properties_(NSPNGFileType, None)
-            image_path.write_bytes(bytes(png_data))
-        else:
-            image_path = path
-        pages.append(
-            PageContext(
-                page_number=page_number,
-                width=float(bounds.size.width) if bounds is not None else None,
-                height=float(bounds.size.height) if bounds is not None else None,
-                page_image_path=image_path,
-                native_text_blocks=[],
-                native_text=page_text,
-            )
-        )
-    return pages
-
-
-def _extract_pdf_text_fallback(path: Path) -> str:
-    xmp_text = _extract_pdf_xmp_packet(path)
-    if xmp_text:
-        xmp_candidates = _extract_xmp_text_candidates(xmp_text)
-        if xmp_candidates and (len(xmp_candidates) >= 3 or sum(len(item) for item in xmp_candidates) >= 200):
-            return "\n".join(xmp_candidates)
-
-    try:
-        completed = subprocess.run(
-            ["strings", "-n", "8", str(path)],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except Exception:
-        return ""
-
-    lines = []
-    for raw_line in completed.stdout.splitlines():
-        line = re.sub(r"<[^>]+>", " ", raw_line)
-        line = " ".join(line.split()).strip()
-        if len(line) < 20:
-            continue
-        if _looks_like_pdf_syntax(line):
-            continue
-        if max((len(token) for token in line.split()), default=0) > 40:
-            continue
-        if not any(character.isalpha() for character in line):
-            continue
-        alpha_ratio = sum(character.isalpha() or character.isspace() for character in line) / max(len(line), 1)
-        if alpha_ratio < 0.6:
-            continue
-        if len(re.findall(r"[A-Za-z]{3,}", line)) < 4:
-            continue
-        lines.append(line)
-    return "\n".join(_dedupe_text_lines(lines))
-
-
-def _build_native_text_items(page: PageContext) -> list[OCRTextItem]:
-    segments = _split_native_text(page.native_text)
-    items: list[OCRTextItem] = []
-    for index, text in enumerate(segments, start=1):
-        y0 = float((index - 1) * 20)
-        items.append(
-            OCRTextItem(
-                item_id=f"p{page.page_number}_native_{index}",
-                page_number=page.page_number,
-                text=text,
-                bbox=BoundingBox(x0=0.0, y0=y0, x1=1000.0, y1=y0 + 18.0),
-                confidence=1.0,
-                source="native_text_fallback",
-            )
-        )
-    return items
-
-
-def _split_native_text(text: str, *, max_chars: int = 500) -> list[str]:
-    cleaned = "\n".join(line.strip() for line in text.splitlines() if line.strip())
-    if not cleaned:
-        return []
-    paragraphs = [part.strip() for part in re.split(r"\n{2,}", cleaned) if part.strip()]
-    if not paragraphs:
-        paragraphs = [cleaned]
-    segments: list[str] = []
-    for paragraph in paragraphs:
-        if len(paragraph) <= max_chars:
-            segments.append(paragraph)
-            continue
-        start = 0
-        while start < len(paragraph):
-            end = min(len(paragraph), start + max_chars)
-            segments.append(paragraph[start:end].strip())
-            start = end
-    return [segment for segment in segments if segment]
-
-
-def _dedupe_text_lines(lines: list[str]) -> list[str]:
-    deduped: list[str] = []
-    seen: set[str] = set()
-    for line in lines:
-        key = line.casefold()
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(line)
-    return deduped
-
-
-def _looks_like_pdf_syntax(text: str) -> bool:
-    lowered = text.lower()
-    pdf_markers = (
-        "%pdf",
-        " obj",
-        "endobj",
-        "stream",
-        "endstream",
-        "/type/",
-        "/filter/",
-        "/length",
-        "/xobject",
-        "/mediabox",
-        "/cropbox",
-        "/resources",
-        "/flatedecode",
-        "xref",
-        "startxref",
-        "xpacket",
-        "rdf:",
-        "xmlns:",
-        "adobe xmp",
-        "jpeg",
-        "base64",
-    )
-    if any(marker in lowered for marker in pdf_markers):
-        return True
-    symbol_ratio = sum(character in "<>/[]{}=_:" for character in text) / max(len(text), 1)
-    return symbol_ratio > 0.15
-
-
-def _extract_xmp_text_candidates(raw_text: str) -> list[str]:
-    candidates: list[str] = []
-    for match in re.finditer(r">([^<>]{20,})<", raw_text):
-        text = html.unescape(" ".join(match.group(1).split())).strip()
-        if len(text) < 20 or _looks_like_pdf_syntax(text):
-            continue
-        alpha_ratio = sum(character.isalpha() or character.isspace() for character in text) / max(len(text), 1)
-        if alpha_ratio < 0.7:
-            continue
-        candidates.append(text)
-    return _dedupe_text_lines(candidates)
-
-
-def _extract_pdf_xmp_packet(path: Path) -> str:
-    raw_text = path.read_bytes().decode("latin1", errors="ignore")
-    match = re.search(r"<\?xpacket begin=.*?</x:xmpmeta>", raw_text, flags=re.DOTALL)
-    if not match:
-        return ""
-    packet = match.group(0)
-    packet = re.sub(r"<xmpGImg:image>.*?</xmpGImg:image>", " ", packet, flags=re.DOTALL)
-    return packet

@@ -29,8 +29,10 @@ class OpenAIEmbeddingBackend:
 
 
 def build_embedding_backend(settings: Settings) -> EmbeddingBackend:
+    if not settings.openai_api_key:
+        raise RuntimeError("OPENAI_API_KEY is required for embeddings and retrieval.")
     return OpenAIEmbeddingBackend(
         settings.embedding_model,
-        api_key=settings.agent_llm_api_key or "",
-        base_url=settings.agent_llm_base_url,
+        api_key=settings.openai_api_key or "",
+        base_url=settings.openai_base_url,
     )

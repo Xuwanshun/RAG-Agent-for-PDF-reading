@@ -5,7 +5,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
-RegionType = Literal["text_block", "table", "chart"]
+RegionType = Literal["text_block", "table", "figure"]
 
 
 class BoundingBox(BaseModel):
@@ -76,7 +76,7 @@ class LayoutRegion(BaseModel):
     bbox: BoundingBox
     confidence: float | None = None
     crop_path: str | None = None
-    source: str = "paddleocr_layout"
+    source: str = "paddle_layout_detection"
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -100,45 +100,6 @@ class RegionAssociation(BaseModel):
     overlap_ratio: float = 0.0
 
 
-class AnalyzeChartInput(BaseModel):
-    region_id: str
-    page_number: int
-    region_type: Literal["chart"]
-    bbox: list[float]
-    crop_path: str
-    context_text: str = ""
-
-
-class AnalyzeTableInput(BaseModel):
-    region_id: str
-    page_number: int
-    region_type: Literal["table"]
-    bbox: list[float]
-    crop_path: str
-    context_text: str = ""
-
-
-class ChartAnalysisOutput(BaseModel):
-    region_id: str
-    page_number: int
-    region_type: Literal["chart"] = "chart"
-    chart_type: str | None = None
-    axes: list[dict[str, Any]] = Field(default_factory=list)
-    data_points: list[dict[str, Any]] = Field(default_factory=list)
-    trend_summary: str | None = None
-    notes: list[str] = Field(default_factory=list)
-
-
-class TableAnalysisOutput(BaseModel):
-    region_id: str
-    page_number: int
-    region_type: Literal["table"] = "table"
-    headers: list[str] = Field(default_factory=list)
-    rows: list[list[Any]] = Field(default_factory=list)
-    values: list[dict[str, Any]] = Field(default_factory=list)
-    notes: list[str] = Field(default_factory=list)
-
-
 class CroppedRegionAsset(BaseModel):
     asset_id: str
     region_id: str
@@ -146,6 +107,19 @@ class CroppedRegionAsset(BaseModel):
     region_type: RegionType
     crop_path: str
     bbox: BoundingBox
+
+
+class VisualRegionSummary(BaseModel):
+    summary_id: str
+    region_id: str
+    asset_id: str | None = None
+    page_number: int
+    region_type: RegionType
+    crop_path: str | None = None
+    linked_block_ids: list[str] = Field(default_factory=list)
+    linked_chunk_ids: list[str] = Field(default_factory=list)
+    summary_text: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class ProcessedChunk(BaseModel):
@@ -168,29 +142,6 @@ class ProcessingIssue(BaseModel):
     level: Literal["warning", "error"]
     page_number: int | None = None
     details: dict[str, Any] = Field(default_factory=dict)
-
-
-class AgentInput(BaseModel):
-    ordered_ocr_text: str
-    layout_regions: list[dict[str, Any]]
-    available_tools: list[dict[str, str]]
-    crop_references: list[dict[str, Any]] = Field(default_factory=list)
-
-
-class AgentToolCall(BaseModel):
-    tool_name: Literal["AnalyzeChartTool", "AnalyzeTableTool"]
-    region_id: str
-    tool_input: dict[str, Any] = Field(default_factory=dict)
-    observation: dict[str, Any] = Field(default_factory=dict)
-
-
-class AgentAnalysisResult(BaseModel):
-    summary: str
-    relevant_region_ids: list[str] = Field(default_factory=list)
-    tool_calls: list[AgentToolCall] = Field(default_factory=list)
-    tables_analyzed: list[TableAnalysisOutput] = Field(default_factory=list)
-    charts_analyzed: list[ChartAnalysisOutput] = Field(default_factory=list)
-    ordered_ocr_text_excerpt: str = ""
 
 
 class ProcessingMetadata(BaseModel):
@@ -217,3 +168,17 @@ class ProcessedDocument(BaseModel):
     processing_summary: dict[str, Any] = Field(default_factory=dict)
     agent_input: dict[str, Any] = Field(default_factory=dict)
     agent_output: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProcessedManifest(BaseModel):
+    schema_version: str
+    pipeline_stage: Literal["preprocessing"]
+    processing_status: Literal["completed"]
+    document_id: str
+    source_filename: str
+    source_path: str
+    working_dir: str
+    page_count: int
+    chunk_count: int
+    processing_timestamp: str
+    artifacts: dict[str, str] = Field(default_factory=dict)

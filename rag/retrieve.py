@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from config import Settings
-from document_Process.clients import build_agent_llm
+from document_Process.clients import build_openai_client
 from document_Process.models import ProcessedChunk, ProcessedDocument
 from rag.chunk import ChunkRecord, chunk_records_from_processed_chunks
 from rag.embed import EmbeddingBackend, build_embedding_backend
@@ -267,7 +267,7 @@ def _build_qa_prompt(question: str, retrieved_chunks: list[RetrievedChunk]) -> s
 
 
 def _generate_qa_answer(*, prompt: str, settings: Settings) -> str:
-    client = build_agent_llm(settings)
+    client = build_openai_client(settings)
     return client.generate_text(
         system_prompt="You are a grounded QA assistant.",
         user_prompt=prompt,

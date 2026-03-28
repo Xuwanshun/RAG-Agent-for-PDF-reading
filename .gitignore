@@ -1,1 +1,10 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
 .env
+.DS_Store
+.paddlex/
+.pytest_cache/
+Data/Processed/
+Data/Embedded/

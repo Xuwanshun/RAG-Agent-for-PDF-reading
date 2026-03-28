@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import logging
 from pathlib import Path
 
@@ -10,13 +11,12 @@ from document_Process.services import (
     AssociationService,
     CroppingService,
     DocumentLoaderService,
-    LangChainAgentService,
     LayoutDetectionService,
     OCRService,
     ReadingOrderService,
-    build_agent_input,
     build_chunks,
     build_document_artifacts,
+    build_visual_summaries,
     export_artifacts,
 )
 
@@ -33,7 +33,7 @@ class PreprocessingResult:
 
 
 class DocumentPreprocessingPipeline:
-    """Deterministic preprocessing pipeline plus a two-tool LangChain agent stage."""
+    """Input -> PaddleOCR -> reading order -> Paddle layout -> crop -> frozen artifacts."""
 
     def __init__(
         self,
@@ -45,7 +45,6 @@ class DocumentPreprocessingPipeline:
         layout: LayoutDetectionService | None = None,
         association: AssociationService | None = None,
         cropping: CroppingService | None = None,
-        agent: LangChainAgentService | None = None,
     ) -> None:
         self.settings = settings
         self.loader = loader or DocumentLoaderService(settings)
@@ -54,7 +53,6 @@ class DocumentPreprocessingPipeline:
         self.layout = layout or LayoutDetectionService()
         self.association = association or AssociationService()
         self.cropping = cropping or CroppingService()
-        self.agent = agent or LangChainAgentService(settings)
 
     def run(self, source_path: Path, *, document_id: str | None = None) -> PreprocessingResult:
         logger.info("Starting document preprocessing for %s", source_path)
@@ -87,10 +85,12 @@ class DocumentPreprocessingPipeline:
             target_chars=self.settings.preprocess_chunk_size,
             overlap_chars=self.settings.preprocess_chunk_overlap,
         )
-
-        agent_input = build_agent_input(ordered_text=ordered_text, regions=regions)
-        agent_result = self.agent.run(agent_input)
-        issues.extend(agent_result.issues)
+        visual_summaries = build_visual_summaries(
+            regions=regions,
+            ordered_blocks=ordered_blocks,
+            chunks=chunks,
+            cropped_assets=cropped_assets,
+        )
 
         document, metadata = build_document_artifacts(
             loaded=loaded,
@@ -99,8 +99,6 @@ class DocumentPreprocessingPipeline:
             regions=regions,
             cropped_assets=cropped_assets,
             chunks=chunks,
-            agent_input=agent_input,
-            agent_result=agent_result,
             reading_order_model=reading_order.get("resolver", "unknown"),
             layout_detection_model=layout_model,
             issues=issues,
@@ -108,12 +106,14 @@ class DocumentPreprocessingPipeline:
 
         document_json_path = export_artifacts(
             working_dir=loaded.working_dir,
+            loaded=loaded,
             raw_ocr=ocr_pages,
             reading_order=reading_order,
             ordered_text=ordered_text,
             regions=regions,
             region_associations=associations,
             cropped_assets=cropped_assets,
+            visual_summaries=visual_summaries,
             chunks=chunks,
             document=document,
             metadata=metadata,
@@ -139,10 +139,29 @@ def preprocess_document(
     *,
     settings: Settings | None = None,
     document_id: str | None = None,
+    force: bool = False,
 ) -> PreprocessingResult:
     resolved_settings = settings or Settings()
     source_path = Path(source_name_or_path)
     if not source_path.is_absolute() and source_path.parent == Path("."):
         source_path = resolved_settings.raw_documents_dir / source_path
-    pipeline = DocumentPreprocessingPipeline(resolved_settings)
-    return pipeline.run(source_path, document_id=document_id)
+    loader = DocumentLoaderService(resolved_settings)
+    resolved_id = document_id or loader._build_document_id(source_path)
+    working_dir = resolved_settings.processed_documents_dir / resolved_id
+    manifest_path = working_dir / "manifest.json"
+    chunks_path = working_dir / "chunks.json"
+    document_path = working_dir / "document.json"
+    if not force and manifest_path.exists() and chunks_path.exists() and document_path.exists():
+        logger.info("Reusing frozen preprocessing for %s", source_path)
+        chunk_count = len(json.loads(chunks_path.read_text(encoding="utf-8")))
+        metadata_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        return PreprocessingResult(
+            document_id=resolved_id,
+            working_dir=working_dir,
+            document_json_path=document_path,
+            page_count=int(metadata_payload.get("page_count") or 0),
+            chunk_count=chunk_count,
+            warnings=[],
+        )
+    pipeline = DocumentPreprocessingPipeline(resolved_settings, loader=loader)
+    return pipeline.run(source_path, document_id=resolved_id)
