@@ -12,7 +12,7 @@ pip install -r requirements-dev.txt    # CI/test deps (no Paddle)
 cp .env.example .env                   # then fill in OPENAI_API_KEY
 ```
 
-Required env vars: `OPENAI_API_KEY`. Optional: `OPENAI_BASE_URL`.
+Required env vars: `OPENAI_API_KEY` (plus `JWT_SECRET_KEY` for the API server). Optional: `OPENAI_BASE_URL`.
 
 ## Common Commands
 
@@ -61,19 +61,21 @@ Two entry points share the same core pipeline:
    - `pipeline.py`: orchestrates `DocumentPreprocessingPipeline`
    - Services chain: `DocumentLoaderService` → `OCRService` (PaddleOCR) → `ReadingOrderService` → `LayoutDetectionService` (PP-DocLayout_plus-L) → `AssociationService` → `CroppingService`
    - `intelligence_service.py`: optional title propagation, section grouping, document descriptor (opt-in via `USE_DOCUMENT_INTELLIGENCE=true`)
+   - Optional ingestion stages (code-default off, enabled in production `scripts/set-flags.sh`): adaptive chunking (`USE_ADAPTIVE_CHUNKING`) and LayoutReader-based reading order (`USE_LAYOUT_READER`, model `hantian/layoutreader`)
    - Outputs `document.json`, `chunks.json`, and cropped region images into `data/processed/<document_id>/`
-   - Optional: `vlm.py` generates `visual_summaries.json` with GPT-4o descriptions for tables/figures (opt-in via `USE_VLM_SUMMARIES=true`). When `VLM_BASE_URL` is set, tries the self-hosted Modal/Qwen3-VL endpoint first and falls back to GPT-4o on any error.
+   - Optional: `vlm.py` generates `visual_summaries.json` with vision-model descriptions for tables/figures (opt-in via `USE_VLM_SUMMARIES=true`). Backend priority in `vlm.py`: `QWEN_BASE_URL` (vLLM-served Qwen3-VL) → `VLM_BASE_URL` (self-hosted Modal endpoint, `MODEL_ID=azhuang3/qwen3_vlm_task`) → `VLM_MODEL` (OpenAI GPT-4o — the default fallback); each backend falls through to the next on error.
 
 2. **`rag/`** — frozen artifacts → vector index → answers
    - `chunk.py`: converts `ProcessedChunk` → `ChunkRecord` (flat, embeddable)
    - `embed.py`: OpenAI `text-embedding-3-small` via `EmbeddingBackend`
-   - `retrieve.py`: `DocumentRetriever` + `JsonVectorStore` (default) or `ChromaVectorStore` (opt-in via `PREFER_CHROMA=true`)
-   - `hybrid.py`: BM25 + vector Reciprocal Rank Fusion (opt-in via `USE_HYBRID_RETRIEVAL=true`)
-   - `query_enhancement.py`: HyDE + query decomposition + query classification (opt-in via `USE_QUERY_ENHANCEMENT=true`)
-   - `rerank.py`: LLM-based chunk reranking with score threshold filtering (opt-in via `USE_LLM_RERANKER=true`)
-   - `compress.py`: LLM context compression — strips irrelevant content before synthesis (opt-in via `USE_CONTEXT_COMPRESSION=true`)
-   - `faithfulness.py`: claim-by-claim answer verification and rewriting (opt-in via `USE_FAITHFULNESS_CHECK=true`)
+   - `retrieve.py`: `DocumentRetriever` + one of three vector stores — `JsonVectorStore` (default), `ChromaVectorStore` (`PREFER_CHROMA=true`), or `WeaviateVectorStore` (`PREFER_WEAVIATE=true`; tenant-per-user isolation, local or Weaviate Cloud)
+   - `hybrid.py`: BM25 + vector Reciprocal Rank Fusion (`USE_HYBRID_RETRIEVAL`, code-default off)
+   - `query_enhancement.py`: HyDE + query decomposition + query classification (`USE_QUERY_ENHANCEMENT`, code-default **on**)
+   - `rerank.py`: LLM-based chunk reranking with score threshold filtering (`USE_LLM_RERANKER`, code-default off)
+   - `compress.py`: LLM context compression — strips irrelevant content before synthesis (`USE_CONTEXT_COMPRESSION`, code-default off)
+   - `faithfulness.py`: claim-by-claim answer verification and rewriting (`USE_FAITHFULNESS_CHECK`, code-default off)
    - `qa.py`: orchestrates the full retrieval + answer pipeline, returns `QAResponse` with answer + sources
+   - **Feature-flag profiles:** `config.py` code defaults keep most stages off (only query enhancement on); `.env.example` also enables hybrid retrieval, reranking, compression, and the faithfulness check; production `scripts/set-flags.sh` enables everything plus `PREFER_WEAVIATE`. Inspect a running task's flags with `scripts/check-flags.sh`.
 
 3. **`api/`** — FastAPI HTTP layer
    - `app.py`: factory function `create_app(settings)` — always use this pattern for tests
@@ -108,8 +110,10 @@ cdk deploy --all  # deploy all stacks
 ```
 
 **Scripts** (`scripts/`):
-- `modal_vlm.py`: deploys fine-tuned Qwen3-VL model on Modal.com as an OpenAI-compatible endpoint
+- `modal_vlm.py`: deploys the fine-tuned Qwen3-VL model (`azhuang3/qwen3_vlm_task`) on Modal.com as an OpenAI-compatible endpoint
 - `up.sh` / `down.sh`: scale ECS service to 2 / 0
+- `set-flags.sh` / `check-flags.sh`: set / inspect the `USE_*` and `PREFER_*` feature flags on the ECS task definition
+- `download_models.py`: pre-download Paddle models into the cache directory
 - `create-secrets.sh`: creates required Secrets Manager entries before first CDK deploy
 - `set-database-url.sh`: updates the database URL secret after RDS is provisioned
 

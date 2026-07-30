@@ -136,15 +136,15 @@ POST /query  { question, doc_filter[], conversation_id }
         ├── 3. Query enhancement             HyDE + decomposition + classification
         │                                    (USE_QUERY_ENHANCEMENT, default on)
         ├── 4. Retrieval
-        │     ├── Hybrid: BM25 + vector RRF  (USE_HYBRID_RETRIEVAL, default on)
+        │     ├── Hybrid: BM25 + vector RRF  (USE_HYBRID_RETRIEVAL, on in .env.example)
         │     └── Dense only: vector search  (fallback when hybrid off)
         ├── 5. LLM reranking                 score + filter low-relevance chunks
-        │                                    (USE_LLM_RERANKER, default on)
+        │                                    (USE_LLM_RERANKER, on in .env.example)
         ├── 6. Context compression           strip irrelevant sentences
-        │                                    (USE_CONTEXT_COMPRESSION, default on)
+        │                                    (USE_CONTEXT_COMPRESSION, on in .env.example)
         ├── 7. Generate answer               GPT-4.1-mini with retrieved context
         ├── 8. Faithfulness check            verify + rewrite unsupported claims
-        │                                    (USE_FAITHFULNESS_CHECK, default on)
+        │                                    (USE_FAITHFULNESS_CHECK, on in .env.example)
         ├── 9. Save assistant message + sources to DB
         └── 10. Return { answer, sources[], conversation_id }
 ```
@@ -164,7 +164,7 @@ flowchart TD
         LD["LayoutDetectionService: PP DocLayout cached singleton"]
         AS["AssociationService: link text to regions"]
         CR["CroppingService: crop tables and figures"]
-        VLM["VLM Enrichment: gpt-4o"]
+        VLM["VLM Enrichment: Qwen3-VL or gpt-4o"]
         ARTS["Frozen Artifacts: document json, chunks json, crops"]
     end
 
@@ -174,6 +174,7 @@ flowchart TD
         VS{"VectorStore"}
         JVS["JsonVectorStore: store json"]
         CVS["ChromaVectorStore"]
+        WVS["WeaviateVectorStore: cloud or local, tenant-per-user"]
         QA["qa.py: gpt-4.1-mini QAResponse and sources"]
     end
 
@@ -219,9 +220,11 @@ flowchart TD
     CH --> EM
     EM --> VS
     VS -->|default| JVS
-    VS -->|optional| CVS
+    VS -->|PREFER_CHROMA| CVS
+    VS -->|PREFER_WEAVIATE| WVS
     JVS --> QA
     CVS --> QA
+    WVS --> QA
 
     APP --> AUTH
     APP --> DR
@@ -243,6 +246,28 @@ flowchart TD
     ALB --> ECS
     SM -->|inject at startup| ECS
 ```
+
+---
+
+## Feature Flags
+
+All flags are read by `Settings` (`config.py`) from env vars. **Code default** is the value with no env override; **`.env.example`** is the recommended local profile; **Production** is what `scripts/set-flags.sh` writes to the ECS task definition (inspect a running task with `scripts/check-flags.sh`).
+
+| Flag | Code default | `.env.example` | Production |
+|---|---|---|---|
+| `USE_QUERY_ENHANCEMENT` | on | on | on |
+| `USE_HYBRID_RETRIEVAL` | off | on | on |
+| `USE_LLM_RERANKER` | off | on | on |
+| `USE_CONTEXT_COMPRESSION` | off | on | on |
+| `USE_FAITHFULNESS_CHECK` | off | on | on |
+| `USE_DOCUMENT_INTELLIGENCE` | off | off | on |
+| `USE_ADAPTIVE_CHUNKING` | off | off | on |
+| `USE_VLM_SUMMARIES` | off | off | on |
+| `USE_LAYOUT_READER` | off | — | — |
+| `PREFER_CHROMA` | off | off | off |
+| `PREFER_WEAVIATE` | off | off | on |
+
+**Vector store** is selected by `PREFER_CHROMA` / `PREFER_WEAVIATE`, with the JSON store as the default. Production routes queries to **Weaviate Cloud**; the JSON store's S3 sync is skipped when Weaviate is active.
 
 ---
 
@@ -453,7 +478,7 @@ Browser                    FastAPI                  Background Thread
   ├── OS + Python runtime        ~300 MB
   ├── PaddleOCR model            ~800 MB  (singleton, loaded once)
   ├── LayoutDetection model      ~600 MB  (singleton, loaded once)
-  ├── Active page image in RAM   ~14–54 MB  (at render_scale=3.0)
+  ├── Active page image in RAM   ~6–24 MB   (at pdf_render_scale=2.0)
   └── OCR text results           ~small
 
 Single upload peak:    ~1.7 GB  ✅
@@ -507,14 +532,14 @@ cd ..
 
 The preprocessing pipeline uses:
 
-- `pypdfium2` for PDF page rendering (render_scale=3.0 by default)
+- `pypdfium2` for PDF page rendering (`pdf_render_scale=2.0` by default)
 - PaddleOCR (`PP-OCRv4_mobile`) for text extraction and bounding boxes
 - Paddle `LayoutDetection` (`PP-DocLayout_plus-L`) for text blocks, tables, figures
 - Reading order resolved from OCR bounding box positions
-- Optional GPT-4o vision enrichment for table/figure regions (`USE_VLM_SUMMARIES=true`). When `VLM_BASE_URL` is set, the pipeline calls the self-hosted Modal/Qwen3-VL endpoint first and falls back to GPT-4o on any error or timeout.
+- Optional vision enrichment for table/figure regions (`USE_VLM_SUMMARIES=true`). Backend priority in `vlm.py`: `QWEN_BASE_URL` (vLLM-served Qwen3-VL) → `VLM_BASE_URL` (self-hosted Modal endpoint) → `VLM_MODEL` (OpenAI GPT-4o, the default fallback); each backend falls through to the next on error or timeout.
 
 Important notes:
 
 - First run downloads Paddle models into the configured `PADDLE_CACHE_DIR`
 - `enable_mkldnn=False` is required on x86 CPU — workaround for PaddlePaddle 3.3.x regression ([issue #77340](https://github.com/PaddlePaddle/Paddle/issues/77340))
-- The only LLM backend is OpenAI (embeddings + generation)
+- Embeddings and answer generation always use OpenAI (`text-embedding-3-small`, `gpt-4.1-mini`); only the optional VLM visual-summary step can use a self-hosted endpoint
