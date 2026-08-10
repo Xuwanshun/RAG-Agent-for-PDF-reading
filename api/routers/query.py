@@ -20,7 +20,7 @@ from sqlalchemy import insert, select
 from api.dependencies import get_current_user
 from config import user_scoped_settings
 from db.models import conversations, messages
-from rag.qa import answer_question_from_frozen_artifacts
+from rag.dispatch import answer_question
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/query", tags=["query"])
@@ -102,7 +102,7 @@ async def query(request: Request, body: QueryRequest, user: dict = Depends(get_c
     logger.info("Query received: %r (top_k=%d, conversation=%s)", body.question, body.top_k, conversation_id)
     started = time.time()
     try:
-        response = answer_question_from_frozen_artifacts(
+        response = answer_question(
             body.question,
             settings=scoped,
             top_k=body.top_k,

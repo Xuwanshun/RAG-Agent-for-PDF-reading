@@ -34,7 +34,7 @@ from pathlib import Path
 from config import Settings
 from document_process.clients import build_openai_client
 from eval.metrics import score_sample
-from rag.qa import answer_question_from_frozen_artifacts
+from rag.dispatch import answer_question
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +81,7 @@ def run(
             logger.info("[%d/%d] %s", i, len(questions), question[:80])
 
             try:
-                response = answer_question_from_frozen_artifacts(
+                response = answer_question(
                     question,
                     settings=resolved,
                     doc_filter=doc_filter,

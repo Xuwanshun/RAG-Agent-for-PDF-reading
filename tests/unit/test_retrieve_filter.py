@@ -88,7 +88,7 @@ def test_query_endpoint_forwards_question(tmp_settings):
         router={},
         specialists=[],
     )
-    with patch("api.routers.query.answer_question_from_frozen_artifacts", return_value=mock_response) as mock_fn:
+    with patch("api.routers.query.answer_question", return_value=mock_response) as mock_fn:
         with TestClient(app) as client:
             # Register a user and obtain a token for auth
             r = client.post("/auth/register", json={"email": "query@example.com", "password": "password123"})

@@ -31,6 +31,9 @@ FLAG_USE_LLM_RERANKER="true"
 FLAG_USE_CONTEXT_COMPRESSION="true"
 FLAG_USE_FAITHFULNESS_CHECK="true"
 
+# Agentic pipeline — off until the eval harness shows it beats the linear baseline
+FLAG_USE_LANGGRAPH_AGENT="false"
+
 # Vector store backend
 FLAG_PREFER_WEAVIATE="true"         # route queries to Weaviate Cloud (pre-built indexes, fast)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -78,6 +81,7 @@ flags = {
     "USE_LLM_RERANKER":        "__FLAG_USE_LLM_RERANKER__",
     "USE_CONTEXT_COMPRESSION": "__FLAG_USE_CONTEXT_COMPRESSION__",
     "USE_FAITHFULNESS_CHECK":  "__FLAG_USE_FAITHFULNESS_CHECK__",
+    "USE_LANGGRAPH_AGENT":     "__FLAG_USE_LANGGRAPH_AGENT__",
     "PREFER_WEAVIATE":         "__FLAG_PREFER_WEAVIATE__",
 }
 
@@ -110,6 +114,7 @@ sed -i '' \
   -e "s/__FLAG_USE_LLM_RERANKER__/$FLAG_USE_LLM_RERANKER/g" \
   -e "s/__FLAG_USE_CONTEXT_COMPRESSION__/$FLAG_USE_CONTEXT_COMPRESSION/g" \
   -e "s/__FLAG_USE_FAITHFULNESS_CHECK__/$FLAG_USE_FAITHFULNESS_CHECK/g" \
+  -e "s/__FLAG_USE_LANGGRAPH_AGENT__/$FLAG_USE_LANGGRAPH_AGENT/g" \
   -e "s/__FLAG_PREFER_WEAVIATE__/$FLAG_PREFER_WEAVIATE/g" \
   /tmp/task-def-patched.json
 

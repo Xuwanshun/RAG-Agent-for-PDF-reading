@@ -57,6 +57,13 @@ paddlex[ocr]>=3.4,<4
 # ── LLM / Embeddings ─────────────────────────────────────────────────────────
 openai>=2.30,<3
 
+# ── Agentic RAG graph ────────────────────────────────────────────────────────
+# Powers rag/graph.py — conditional routing plus the self-correcting retrieval
+# loop. Only used when USE_LANGGRAPH_AGENT=true, but imported unconditionally by
+# rag/dispatch.py so it must always be installed.
+# Pure-Python and small (~5 MB with langchain-core); no effect on image size.
+langgraph>=1.0,<2
+
 # ── Auth ─────────────────────────────────────────────────────────────────────
 PyJWT>=2.8,<3
 passlib[bcrypt]>=1.7

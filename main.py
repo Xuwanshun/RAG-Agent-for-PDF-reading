@@ -76,9 +76,9 @@ def main() -> None:
         print(f"indexed {sum(indexed.values())} chunks across {len(indexed)} document(s)")
 
     if args.ask:
-        from rag.qa import answer_question_from_frozen_artifacts
+        from rag.dispatch import answer_question
 
-        response = answer_question_from_frozen_artifacts(args.ask, settings=settings, top_k=args.top_k)
+        response = answer_question(args.ask, settings=settings, top_k=args.top_k)
         print("\nAnswer:")
         print(response.answer)
         if response.sources:

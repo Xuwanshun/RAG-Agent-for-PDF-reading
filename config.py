@@ -191,6 +191,22 @@ class Settings(BaseSettings):
     # Adds two LLM API calls per query when issues are found; disable in tests.
     use_faithfulness_check: bool = False
 
+    # ── LangGraph agentic pipeline ────────────────────────────────────────────
+    # When enabled, POST /query and the eval harness route through rag/graph.py
+    # (LangGraph) instead of the linear rag/qa.py pipeline. The graph adds two
+    # things the linear pipeline cannot express: conditional routing on query
+    # type, and a self-correcting retrieval loop that re-queries when the
+    # retrieved passages are graded insufficient.
+    # Both paths are kept so they can be A/B compared on the same eval set.
+    use_langgraph_agent: bool = False
+    # Maximum number of query rewrites after the initial retrieval attempt.
+    # Total retrieval attempts = graph_max_retrieval_loops + 1.
+    # Each extra loop costs one grade call plus one rewrite call.
+    graph_max_retrieval_loops: int = 2
+    # Chunks scoring at or above this grade are considered sufficient and the
+    # graph proceeds to synthesis instead of rewriting the query.
+    graph_grade_threshold: float = 0.6
+
     # ── Auth ──────────────────────────────────────────────────────────────────
     jwt_secret_key: str | None = None
     jwt_algorithm: str = "HS256"

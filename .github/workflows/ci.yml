@@ -43,8 +43,10 @@ jobs:
           python-version: "3.11"
 
       - name: Install ruff
-        # Install only ruff (not the full requirements) for speed.
-        run: pip install "ruff==0.15.11"
+        # Install only ruff (not the full requirements) for speed, but take the
+        # version from requirements-dev.txt so CI and a local venv can never
+        # drift onto different formatting rules.
+        run: pip install "$(grep -E '^ruff==' requirements-dev.txt)"
 
       - name: Run ruff linter
         # ruff check: finds bugs and style issues

@@ -21,6 +21,8 @@ python-multipart>=0.0.9,<1
 python-json-logger>=2.0,<3
 boto3>=1.34,<2
 openai>=2.30,<3
+# Required by rag/graph.py and imported via rag/dispatch.py — tests import it.
+langgraph>=1.0,<2
 # Note: pypdfium2 and Pillow are included because some unit tests use them.
 pypdfium2>=4.30,<5
 Pillow>=10.0,<12
@@ -44,4 +46,10 @@ httpx>=0.27,<1
 
 # ── Linting and formatting ────────────────────────────────────────────────────
 # ruff: extremely fast Python linter + formatter (replaces flake8, isort, black)
-ruff>=0.4,<1
+#
+# PINNED, and this line is the single source of truth for the ruff version:
+# both CI workflows grep it out of this file rather than hardcoding a version.
+# Formatting rules change between ruff minor releases, so an unpinned range means
+# a fresh clone can reformat files CI considers correct (0.16 reformats Python
+# code blocks inside .md, 0.15 does not). Bump this one line to upgrade.
+ruff==0.15.11

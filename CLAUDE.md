@@ -74,7 +74,9 @@ Two entry points share the same core pipeline:
    - `rerank.py`: LLM-based chunk reranking with score threshold filtering (`USE_LLM_RERANKER`, code-default off)
    - `compress.py`: LLM context compression — strips irrelevant content before synthesis (`USE_CONTEXT_COMPRESSION`, code-default off)
    - `faithfulness.py`: claim-by-claim answer verification and rewriting (`USE_FAITHFULNESS_CHECK`, code-default off)
-   - `qa.py`: orchestrates the full retrieval + answer pipeline, returns `QAResponse` with answer + sources
+   - `qa.py`: orchestrates the full **linear** retrieval + answer pipeline, returns `QAResponse` with answer + sources
+   - `graph.py`: **agentic** alternative to `qa.py` built on LangGraph (`USE_LANGGRAPH_AGENT`, code-default off). Adds conditional routing (simple → HyDE, complex → decomposition) and a self-correcting retrieval loop (`grade` → `rewrite` → re-`retrieve`, capped by `GRAPH_MAX_RETRIEVAL_LOOPS`). Reuses the same rerank/compress/faithfulness components as nodes and returns the same `MultiAgentQAResponse`
+   - `dispatch.py`: `answer_question()` — single entry point that picks `graph.py` or `qa.py` based on `USE_LANGGRAPH_AGENT`. The API router, CLI, and eval harness all call this, so the two pipelines can be A/B compared on the same eval set
    - **Feature-flag profiles:** `config.py` code defaults keep most stages off (only query enhancement on); `.env.example` also enables hybrid retrieval, reranking, compression, and the faithfulness check; production `scripts/set-flags.sh` enables everything plus `PREFER_WEAVIATE`. Inspect a running task's flags with `scripts/check-flags.sh`.
 
 3. **`api/`** — FastAPI HTTP layer
