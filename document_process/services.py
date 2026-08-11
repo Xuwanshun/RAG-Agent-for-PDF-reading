@@ -159,16 +159,6 @@ class DocumentLoaderService:
         return digest.hexdigest()
 
 
-# A horizontal gap wider than this multiple of the line height is treated as a
-# table column boundary rather than a style change within a sentence.
-#
-# Calibrated against both failure modes observed in the corpus: adjacent table
-# cells sit ~8 line-heights apart ("Revenue" | "Income"), while a style break
-# inside a hyphenated word sits at ~0.97 ("on a non-" | "GAAP basis was"). Below
-# 1.0 splits hyphenated words; far above it glues table headers together.
-_COLUMN_GAP_RATIO = 1.0
-
-
 def _pdf_rect_to_image_bbox(
     rect: tuple[float, float, float, float],
     *,
@@ -197,68 +187,63 @@ def _pdf_rect_to_image_bbox(
     )
 
 
-def _merge_fragments_into_lines(
-    fragments: list[tuple[BoundingBox, str]],
+def _group_rects_into_lines(
+    rects: list[tuple[float, float, float, float]],
     *,
-    y_tolerance: float,
-) -> list[tuple[BoundingBox, str]]:
+    overlap_ratio: float = 0.5,
+) -> list[tuple[float, float, float, float]]:
     """
-    Group per-style-run text fragments into whole lines.
+    Group PDF text rects belonging to the same visual line into one box.
 
-    pypdfium2 splits a line wherever styling changes, so a heading arrives as
-    'Microsoft Cloud ', 'and AI ', 'Strength '. Each fragment carries its own
-    trailing space, so concatenating them verbatim reproduces the original line
-    exactly — which is the entire point of reading the text layer instead of
-    OCRing a picture of it. Nothing is inserted between fragments.
+    Rects are ``(left, bottom, right, top)`` in PDF points, y increasing upward.
+
+    Grouping is by vertical OVERLAP rather than by edge proximity, because
+    neither edge is stable across a line: tops rise with ascenders and bottoms
+    drop with descenders. Keying on an edge split a descender-bearing word onto
+    its own overlapping line, and querying both boxes then returned that text
+    twice. Two rects join the same line when they overlap vertically by at least
+    ``overlap_ratio`` of the shorter one.
+
+    Returns merged boxes ordered top-to-bottom.
     """
-    usable = [(bbox, text) for bbox, text in fragments if text.strip()]
-    if not usable:
+    if not rects:
         return []
 
-    # Group by BASELINE, not by top edge. Fragments on one visual line share a
-    # baseline, so their bottom edges agree; their top edges do not, because a
-    # run without ascenders sits lower than one with them. Grouping on the top
-    # edge split such runs onto their own line and reassembled the remainder in
-    # x-order, which silently reordered words mid-sentence.
-    usable.sort(key=lambda item: (item[0].y1, item[0].x0))
-    lines: list[list[tuple[BoundingBox, str]]] = []
-    for bbox, text in usable:
-        if lines and abs(bbox.y1 - lines[-1][0][0].y1) <= y_tolerance:
-            lines[-1].append((bbox, text))
-        else:
-            lines.append([(bbox, text)])
+    # Tallest first, so a line is anchored by its full-height rect rather than by
+    # a superscript that happens to come first in reading order.
+    ordered = sorted(rects, key=lambda r: (-(r[3] - r[1]), -r[3], r[0]))
 
-    merged: list[tuple[BoundingBox, str]] = []
-    for line in lines:
-        line.sort(key=lambda item: item[0].x0)
-        parts: list[str] = []
-        previous_bbox: BoundingBox | None = None
-        for bbox, text in line:
-            if previous_bbox is not None:
-                # A wide horizontal gap means a table column boundary, not a
-                # style change. Cell text carries no trailing space, so joining
-                # verbatim would glue headers together ("Revenue" + "Income").
-                gap = bbox.x0 - previous_bbox.x1
-                line_height = max(1.0, previous_bbox.y1 - previous_bbox.y0)
-                crosses_column = gap > line_height * _COLUMN_GAP_RATIO
-                if crosses_column and parts and not parts[-1].endswith(" ") and not text.startswith(" "):
-                    parts.append(" ")
-            parts.append(text)
-            previous_bbox = bbox
-        merged.append(
-            (
-                BoundingBox.merge([bbox for bbox, _ in line]),
-                "".join(parts).strip(),
-            )
-        )
-    return merged
+    groups: list[list[float]] = []  # [left, bottom, right, top] accumulators
+    members: list[list[tuple[float, float, float, float]]] = []
+    for rect in ordered:
+        left, bottom, right, top = rect
+        height = max(top - bottom, 1e-6)
+        placed = False
+        for index, group in enumerate(groups):
+            overlap = min(top, group[3]) - max(bottom, group[1])
+            shorter = min(height, max(group[3] - group[1], 1e-6))
+            if overlap >= overlap_ratio * shorter:
+                group[0] = min(group[0], left)
+                group[1] = min(group[1], bottom)
+                group[2] = max(group[2], right)
+                group[3] = max(group[3], top)
+                members[index].append(rect)
+                placed = True
+                break
+        if not placed:
+            groups.append([left, bottom, right, top])
+            members.append([rect])
+
+    boxes = [(g[0], g[1], g[2], g[3]) for g in groups]
+    boxes.sort(key=lambda b: -b[3])
+    return boxes
 
 
 def _extract_pdf_text_layer(
     pdf_path: Path,
     pages: list[PageContext],
     *,
-    y_tolerance: float = 4.0,
+    baseline_tolerance: float = 2.0,
 ) -> dict[int, list[OCRTextItem]]:
     """
     Read the PDF's embedded text layer, one entry per page that has usable text.
@@ -285,22 +270,38 @@ def _extract_pdf_text_layer(
                 text_page = pdf_page.get_textpage()
                 page_width_pt = float(pdf_page.get_width())
                 page_height_pt = float(pdf_page.get_height())
-                fragments: list[tuple[BoundingBox, str]] = []
-                for rect_index in range(text_page.count_rects()):
-                    rect = text_page.get_rect(rect_index)
-                    text = text_page.get_text_bounded(*rect)
+
+                rects = [text_page.get_rect(i) for i in range(text_page.count_rects())]
+                line_boxes = _group_rects_into_lines(rects)
+
+                items: list[OCRTextItem] = []
+                for order, box in enumerate(line_boxes, start=1):
+                    # Ask the document for this line's text rather than gluing
+                    # fragment strings together. pypdfium2 knows the reading
+                    # order and spacing from the content stream; reassembling it
+                    # by hand dropped hyphens ("non-GAAP" -> "nonGAAP") and split
+                    # numbers across fragments.
+                    text = text_page.get_text_bounded(*box)
                     if not text or not text.strip():
                         continue
-                    fragments.append(
-                        (
-                            _pdf_rect_to_image_bbox(
-                                rect,
-                                page_width_pt=page_width_pt,
-                                page_height_pt=page_height_pt,
-                                image_width=float(page.width or page_width_pt),
-                                image_height=float(page.height or page_height_pt),
-                            ),
-                            text,
+                    bbox = _pdf_rect_to_image_bbox(
+                        box,
+                        page_width_pt=page_width_pt,
+                        page_height_pt=page_height_pt,
+                        image_width=float(page.width or page_width_pt),
+                        image_height=float(page.height or page_height_pt),
+                    )
+                    if not bbox.is_valid():
+                        continue
+                    items.append(
+                        OCRTextItem(
+                            item_id=f"p{page.page_number}_pdftext_{order}",
+                            page_number=page.page_number,
+                            text=" ".join(text.split()),
+                            bbox=bbox,
+                            # The text layer is ground truth, not a prediction.
+                            confidence=1.0,
+                            source="pdf_text_layer",
                         )
                     )
             except Exception as exc:
@@ -311,20 +312,6 @@ def _extract_pdf_text_layer(
                 )
                 continue
 
-            lines = _merge_fragments_into_lines(fragments, y_tolerance=y_tolerance)
-            items = [
-                OCRTextItem(
-                    item_id=f"p{page.page_number}_pdftext_{order}",
-                    page_number=page.page_number,
-                    text=text,
-                    bbox=bbox,
-                    # The text layer is ground truth, not a prediction.
-                    confidence=1.0,
-                    source="pdf_text_layer",
-                )
-                for order, (bbox, text) in enumerate(lines, start=1)
-                if bbox.is_valid()
-            ]
             if items:
                 by_page[page.page_number] = items
     finally:
