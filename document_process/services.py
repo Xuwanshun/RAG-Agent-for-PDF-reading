@@ -159,9 +159,14 @@ class DocumentLoaderService:
         return digest.hexdigest()
 
 
-# A horizontal gap wider than this fraction of the line height is treated as a
+# A horizontal gap wider than this multiple of the line height is treated as a
 # table column boundary rather than a style change within a sentence.
-_COLUMN_GAP_RATIO = 0.3
+#
+# Calibrated against both failure modes observed in the corpus: adjacent table
+# cells sit ~8 line-heights apart ("Revenue" | "Income"), while a style break
+# inside a hyphenated word sits at ~0.97 ("on a non-" | "GAAP basis was"). Below
+# 1.0 splits hyphenated words; far above it glues table headers together.
+_COLUMN_GAP_RATIO = 1.0
 
 
 def _pdf_rect_to_image_bbox(
@@ -210,12 +215,15 @@ def _merge_fragments_into_lines(
     if not usable:
         return []
 
-    # Group by vertical position; a fragment joins the current line while its
-    # top edge stays within y_tolerance of that line's top edge.
-    usable.sort(key=lambda item: (item[0].y0, item[0].x0))
+    # Group by BASELINE, not by top edge. Fragments on one visual line share a
+    # baseline, so their bottom edges agree; their top edges do not, because a
+    # run without ascenders sits lower than one with them. Grouping on the top
+    # edge split such runs onto their own line and reassembled the remainder in
+    # x-order, which silently reordered words mid-sentence.
+    usable.sort(key=lambda item: (item[0].y1, item[0].x0))
     lines: list[list[tuple[BoundingBox, str]]] = []
     for bbox, text in usable:
-        if lines and abs(bbox.y0 - lines[-1][0][0].y0) <= y_tolerance:
+        if lines and abs(bbox.y1 - lines[-1][0][0].y1) <= y_tolerance:
             lines[-1].append((bbox, text))
         else:
             lines.append([(bbox, text)])

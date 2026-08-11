@@ -143,6 +143,44 @@ def test_no_fragments_yields_no_lines():
     assert _merge_fragments_into_lines([], y_tolerance=4.0) == []
 
 
+# ── baseline grouping ─────────────────────────────────────────────────────────
+# Fragments on one visual line share a baseline, so their BOTTOM edges match.
+# Their top edges do not: a run without ascenders ("on a non") starts lower than
+# one with them ("Net incom"). Grouping on the top edge split such a run onto its
+# own line and reassembled the rest in x-order, scrambling the sentence:
+#   real:      "Net income on a GAAP basis was $38.5 billion ... on a non-GAAP
+#               basis was $30.9 billion"
+#   produced:  "e was on a non Net incom on a GAAP basis $38.5 billion ..."
+# which silently swapped which figure belonged to which basis.
+
+
+def test_fragments_sharing_a_baseline_group_together_despite_differing_tops():
+    """Coordinates taken verbatim from page 1 of the FY26 Q2 press release."""
+    fragments = [
+        _frag(217.85, 353.42, 306.74, 368.38, "Net income "),
+        _frag(324.91, 353.24, 467.36, 368.38, "on a GAAP basis "),
+        _frag(840.12, 357.84, 916.41, 368.38, "on a non-"),
+        _frag(926.62, 353.24, 1069.73, 368.38, "GAAP basis was "),
+    ]
+
+    lines = _merge_fragments_into_lines(fragments, y_tolerance=4.0)
+
+    assert len(lines) == 1, "an ascender-free run was split onto its own line"
+    assert lines[0][1] == "Net income on a GAAP basis on a non-GAAP basis was"
+
+
+def test_genuinely_separate_lines_are_still_kept_apart():
+    """The baseline fix must not merge consecutive lines of a paragraph."""
+    fragments = [
+        _frag(100, 200, 300, 215, "first line"),
+        _frag(100, 224, 300, 239, "second line"),
+    ]
+
+    lines = _merge_fragments_into_lines(fragments, y_tolerance=4.0)
+
+    assert [text for _bbox, text in lines] == ["first line", "second line"]
+
+
 # ── table column gaps ─────────────────────────────────────────────────────────
 # Fragments in different table cells sit on the same visual line but are far
 # apart horizontally, and a cell's text carries no trailing space. Concatenating
