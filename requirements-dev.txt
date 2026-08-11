@@ -44,6 +44,22 @@ pytest-asyncio>=0.23,<1
 # httpx: HTTP client used by FastAPI's TestClient
 httpx>=0.27,<1
 
+# ── RAG evaluation ────────────────────────────────────────────────────────────
+# EVAL ONLY. Never add these to requirements.txt: ragas pulls in datasets and
+# pyarrow, which would bloat the runtime image and the ECS task for code that
+# never runs in production.
+#
+# ragas supplies the generation-side metrics (faithfulness, answer relevancy,
+# context precision/recall). Ground-truth retrieval metrics and significance
+# testing live in eval/ because nothing off the shelf computes them.
+ragas>=0.4,<0.5
+# PINNED DELIBERATELY: langchain-community 0.4.x removed
+# langchain_community.chat_models.vertexai, which ragas 0.4.3 imports at module
+# load, so `import ragas` raises ModuleNotFoundError against 0.4.x. 0.3.x still
+# ships the shim. Verified that this pin leaves langchain-core at 1.5.3, so
+# langgraph is unaffected. Revisit when ragas drops the vertexai import.
+langchain-community>=0.3.31,<0.4
+
 # ── Linting and formatting ────────────────────────────────────────────────────
 # ruff: extremely fast Python linter + formatter (replaces flake8, isort, black)
 #

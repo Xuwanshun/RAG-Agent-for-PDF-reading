@@ -68,3 +68,6 @@ cdk/cdk.out/
 
 # Source documents for eval (Microsoft investor relations, not ours to redistribute)
 FY26q2/
+
+# Eval run outputs are regenerable; keep the repo free of them
+eval/results/
