@@ -159,18 +159,217 @@ class DocumentLoaderService:
         return digest.hexdigest()
 
 
+# A horizontal gap wider than this fraction of the line height is treated as a
+# table column boundary rather than a style change within a sentence.
+_COLUMN_GAP_RATIO = 0.3
+
+
+def _pdf_rect_to_image_bbox(
+    rect: tuple[float, float, float, float],
+    *,
+    page_width_pt: float,
+    page_height_pt: float,
+    image_width: float,
+    image_height: float,
+) -> BoundingBox:
+    """
+    Convert a pypdfium2 text rect into rendered-image pixel space.
+
+    PDF text rects are (left, bottom, right, top) in points, measured from a
+    bottom-left origin with y pointing up. Layout regions and OCR boxes are in
+    image pixels from a top-left origin with y pointing down, so the y axis has
+    to be flipped as well as scaled. Getting this wrong does not crash — it
+    silently associates every line with the wrong layout region.
+    """
+    left, bottom, right, top = rect
+    scale_x = image_width / page_width_pt if page_width_pt else 1.0
+    scale_y = image_height / page_height_pt if page_height_pt else 1.0
+    return BoundingBox(
+        x0=left * scale_x,
+        y0=(page_height_pt - top) * scale_y,
+        x1=right * scale_x,
+        y1=(page_height_pt - bottom) * scale_y,
+    )
+
+
+def _merge_fragments_into_lines(
+    fragments: list[tuple[BoundingBox, str]],
+    *,
+    y_tolerance: float,
+) -> list[tuple[BoundingBox, str]]:
+    """
+    Group per-style-run text fragments into whole lines.
+
+    pypdfium2 splits a line wherever styling changes, so a heading arrives as
+    'Microsoft Cloud ', 'and AI ', 'Strength '. Each fragment carries its own
+    trailing space, so concatenating them verbatim reproduces the original line
+    exactly — which is the entire point of reading the text layer instead of
+    OCRing a picture of it. Nothing is inserted between fragments.
+    """
+    usable = [(bbox, text) for bbox, text in fragments if text.strip()]
+    if not usable:
+        return []
+
+    # Group by vertical position; a fragment joins the current line while its
+    # top edge stays within y_tolerance of that line's top edge.
+    usable.sort(key=lambda item: (item[0].y0, item[0].x0))
+    lines: list[list[tuple[BoundingBox, str]]] = []
+    for bbox, text in usable:
+        if lines and abs(bbox.y0 - lines[-1][0][0].y0) <= y_tolerance:
+            lines[-1].append((bbox, text))
+        else:
+            lines.append([(bbox, text)])
+
+    merged: list[tuple[BoundingBox, str]] = []
+    for line in lines:
+        line.sort(key=lambda item: item[0].x0)
+        parts: list[str] = []
+        previous_bbox: BoundingBox | None = None
+        for bbox, text in line:
+            if previous_bbox is not None:
+                # A wide horizontal gap means a table column boundary, not a
+                # style change. Cell text carries no trailing space, so joining
+                # verbatim would glue headers together ("Revenue" + "Income").
+                gap = bbox.x0 - previous_bbox.x1
+                line_height = max(1.0, previous_bbox.y1 - previous_bbox.y0)
+                crosses_column = gap > line_height * _COLUMN_GAP_RATIO
+                if crosses_column and parts and not parts[-1].endswith(" ") and not text.startswith(" "):
+                    parts.append(" ")
+            parts.append(text)
+            previous_bbox = bbox
+        merged.append(
+            (
+                BoundingBox.merge([bbox for bbox, _ in line]),
+                "".join(parts).strip(),
+            )
+        )
+    return merged
+
+
+def _extract_pdf_text_layer(
+    pdf_path: Path,
+    pages: list[PageContext],
+    *,
+    y_tolerance: float = 4.0,
+) -> dict[int, list[OCRTextItem]]:
+    """
+    Read the PDF's embedded text layer, one entry per page that has usable text.
+
+    Pages absent from the returned mapping have no text layer (a scan) and must
+    fall back to OCR. Decided per page so hybrid PDFs — digital pages plus
+    scanned inserts — take the right path for each.
+    """
+    try:
+        import pypdfium2 as pdfium  # type: ignore
+    except Exception:
+        logger.warning("pypdfium2 unavailable; cannot read PDF text layer, falling back to OCR")
+        return {}
+
+    by_page: dict[int, list[OCRTextItem]] = {}
+    pdf = pdfium.PdfDocument(str(pdf_path))
+    try:
+        for page in pages:
+            index = page.page_number - 1
+            if index < 0 or index >= len(pdf):
+                continue
+            try:
+                pdf_page = pdf[index]
+                text_page = pdf_page.get_textpage()
+                page_width_pt = float(pdf_page.get_width())
+                page_height_pt = float(pdf_page.get_height())
+                fragments: list[tuple[BoundingBox, str]] = []
+                for rect_index in range(text_page.count_rects()):
+                    rect = text_page.get_rect(rect_index)
+                    text = text_page.get_text_bounded(*rect)
+                    if not text or not text.strip():
+                        continue
+                    fragments.append(
+                        (
+                            _pdf_rect_to_image_bbox(
+                                rect,
+                                page_width_pt=page_width_pt,
+                                page_height_pt=page_height_pt,
+                                image_width=float(page.width or page_width_pt),
+                                image_height=float(page.height or page_height_pt),
+                            ),
+                            text,
+                        )
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Text layer read failed on page %s (%s); falling back to OCR for that page",
+                    page.page_number,
+                    exc,
+                )
+                continue
+
+            lines = _merge_fragments_into_lines(fragments, y_tolerance=y_tolerance)
+            items = [
+                OCRTextItem(
+                    item_id=f"p{page.page_number}_pdftext_{order}",
+                    page_number=page.page_number,
+                    text=text,
+                    bbox=bbox,
+                    # The text layer is ground truth, not a prediction.
+                    confidence=1.0,
+                    source="pdf_text_layer",
+                )
+                for order, (bbox, text) in enumerate(lines, start=1)
+                if bbox.is_valid()
+            ]
+            if items:
+                by_page[page.page_number] = items
+    finally:
+        pdf.close()
+    return by_page
+
+
 class OCRService:
     def extract(
         self,
         pages: list[PageContext],
         *,
+        pdf_path: Path | None = None,
         on_page_done: Callable[[], None] | None = None,
     ) -> tuple[list[OCRPageResult], list[ProcessingIssue]]:
-        logger.info("Running PaddleOCR text extraction on %s page(s)", len(pages))
-        ocr = _get_paddle_ocr()
+        # Prefer the PDF's own text layer where it exists. OCR reconstructs text
+        # from pixels and loses word spacing on tightly-set type; the text layer
+        # is what the document actually says. OCR stays the path for scans.
+        text_layer = _extract_pdf_text_layer(pdf_path, pages) if pdf_path is not None else {}
+        if text_layer:
+            logger.info(
+                "Using embedded PDF text layer for %s of %s page(s)",
+                len(text_layer),
+                len(pages),
+            )
+
+        # Loaded lazily so a fully born-digital PDF never pays to start Paddle.
+        ocr = None
         results: list[OCRPageResult] = []
         issues: list[ProcessingIssue] = []
         for page in pages:
+            layer_items = text_layer.get(page.page_number)
+            if layer_items:
+                results.append(
+                    OCRPageResult(
+                        page_number=page.page_number,
+                        width=page.width,
+                        height=page.height,
+                        items=layer_items,
+                        text_source="pdf_text_layer",
+                        page_image_path=str(page.page_image_path),
+                    )
+                )
+                try:
+                    if on_page_done is not None:
+                        on_page_done()
+                except Exception:
+                    pass
+                continue
+
+            if ocr is None:
+                logger.info("Running PaddleOCR text extraction (no usable text layer)")
+                ocr = _get_paddle_ocr()
             try:
                 payload = ocr.predict(str(page.page_image_path))[0].json["res"]
             except Exception as exc:

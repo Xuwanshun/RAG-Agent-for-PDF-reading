@@ -90,11 +90,13 @@ Rank all candidates from most to least relevant.
 For table/figure candidates: a good description that names relevant columns, values, \
 or trends ranks above prose that only mentions the topic in passing.
 
+Refer to each candidate by its [ID: n] number. Score every candidate you rank.
+
 Output format (strict JSON):
 {{
-  "ranking": ["chunk_id_1", "chunk_id_2", ...],
-  "scores": {{"chunk_id_1": 0.95, "chunk_id_2": 0.82, ...}},
-  "dropped": ["chunk_id_n"],
+  "ranking": ["2", "1", ...],
+  "scores": {{"2": 0.95, "1": 0.82, ...}},
+  "dropped": ["3"],
   "top_region_type": "prose|table|figure"
 }}"""
 
@@ -133,9 +135,17 @@ def _primary_region_type(chunk: RetrievedChunk) -> str:
 
 
 def _format_candidate_block(chunks: list[RetrievedChunk], visual_summaries: dict[str, Any]) -> str:
-    """Format all candidates as the multi-line block expected by RERANK_BATCH_PROMPT."""
+    """
+    Format all candidates as the multi-line block expected by RERANK_BATCH_PROMPT.
+
+    Candidates are labelled with their 1-based position, not their chunk_id. A
+    chunk_id is a 64-hex-digit document hash plus a suffix; asking the model to
+    echo that back exactly for every passage meant a single mis-transcribed
+    character silently detached that passage's score. Positions are mapped back
+    to chunks by the caller.
+    """
     lines: list[str] = []
-    for chunk in chunks:
+    for label, chunk in enumerate(chunks, start=1):
         region_type = _primary_region_type(chunk)
         parent_title = chunk.metadata.get("parent_title") or ""
         parent_subtitle = chunk.metadata.get("parent_subtitle") or ""
@@ -145,7 +155,7 @@ def _format_candidate_block(chunks: list[RetrievedChunk], visual_summaries: dict
         content = _best_content(chunk, visual_summaries)
 
         lines.append(
-            f"[ID: {chunk.chunk_id}]\n"
+            f"[ID: {label}]\n"
             f"Type: {region_type}\n"
             f"Section: {section}\n"
             f"Content: {content[:600]}"  # cap to avoid oversized prompts
@@ -261,7 +271,8 @@ class LLMReranker:
         summaries = visual_summaries or {}
         query_intent = detect_query_type(query)
         candidates_block = _format_candidate_block(chunks, summaries)
-        candidate_ids = [c.chunk_id for c in chunks]
+        # Positional labels, matching the [ID: n] markers in the candidate block.
+        candidate_ids = [str(index) for index in range(1, len(chunks) + 1)]
 
         user_prompt = RERANK_BATCH_PROMPT.format(
             n_candidates=len(chunks),
@@ -282,17 +293,29 @@ class LLMReranker:
             return chunks
 
         dropped_set = set(result.dropped)
-        # Build a lookup from chunk_id → chunk
-        chunk_map = {c.chunk_id: c for c in chunks}
+        # Candidates were labelled by position, so map the labels back to chunks.
+        chunk_map = {label: chunk for label, chunk in zip(candidate_ids, chunks, strict=False)}
+
+        if not result.scores:
+            # Distinct from "the model judged these irrelevant": the reply had no
+            # usable scores at all (unparseable JSON, or the field was omitted).
+            logger.warning("LLM reranker returned no usable scores — keeping retrieval order")
 
         reranked: list[RetrievedChunk] = []
-        for chunk_id in result.ranking:
-            if chunk_id in dropped_set:
+        for label in result.ranking:
+            if label in dropped_set:
                 continue
-            chunk = chunk_map.get(chunk_id)
+            chunk = chunk_map.get(label)
             if chunk is None:
                 continue
-            llm_score = result.scores.get(chunk_id, chunk.score)
+            llm_score = result.scores.get(label)
+            if llm_score is None:
+                # The model did not score this chunk. Its existing score is a
+                # retrieval score (RRF values top out around 0.03) and cannot be
+                # compared against a 0-1 relevance threshold, so keep the chunk:
+                # "not scored" is not the same as "judged irrelevant".
+                reranked.append(chunk)
+                continue
             if llm_score < drop_threshold:
                 continue
             reranked.append(
@@ -304,9 +327,12 @@ class LLMReranker:
                 )
             )
 
-        # If the model dropped everything, fall back to original list
+        # If the model genuinely rated everything below the threshold, fall back
+        # rather than hand the synthesiser nothing.
         if not reranked:
-            logger.warning("LLM reranker dropped all chunks — falling back to original order")
+            logger.warning(
+                "LLM reranker scored all chunks below %.2f — falling back to retrieval order", drop_threshold
+            )
             return chunks
 
         return reranked

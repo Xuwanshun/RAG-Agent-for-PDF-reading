@@ -109,7 +109,13 @@ class DocumentPreprocessingPipeline:
                 last_page,
             )
 
-            ocr_batch, ocr_issues = self.ocr.extract(batch, on_page_done=_on_page_done)
+            # Pass the PDF so OCRService can read its embedded text layer where
+            # one exists; None for images, which have nothing to read.
+            ocr_batch, ocr_issues = self.ocr.extract(
+                batch,
+                pdf_path=(loaded.original_copy_path if loaded.original_copy_path.suffix.lower() == ".pdf" else None),
+                on_page_done=_on_page_done,
+            )
             issues.extend(ocr_issues)
 
             ro_batch, ro_issues = self.reading_order.resolve(ocr_batch)

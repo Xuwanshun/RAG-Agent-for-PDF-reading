@@ -85,7 +85,7 @@ def _build_pipeline(settings, tmp_path, num_pages: int):
 
     ocr_mock = MagicMock()
 
-    def ocr_extract(batch_pages, *, on_page_done=None):
+    def ocr_extract(batch_pages, *, pdf_path=None, on_page_done=None):
         nums = [p.page_number for p in batch_pages]
         if on_page_done is not None:
             for _ in batch_pages:
