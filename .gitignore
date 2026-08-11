@@ -65,3 +65,6 @@ infra/.terraform/
 # ── Paddle model weights ──────────────────────────────────────────────────────
 paddle_models/
 cdk/cdk.out/
+
+# Source documents for eval (Microsoft investor relations, not ours to redistribute)
+FY26q2/
