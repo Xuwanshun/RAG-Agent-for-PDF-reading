@@ -191,6 +191,24 @@ class Settings(BaseSettings):
     # Adds two LLM API calls per query when issues are found; disable in tests.
     use_faithfulness_check: bool = False
 
+    # ── LangSmith tracing ─────────────────────────────────────────────────────
+    # When enabled, every OpenAI call is traced to LangSmith, giving a
+    # stage-by-stage waterfall per query (retrieve -> rerank -> compress ->
+    # synthesize -> verify) with latency and token counts. Invaluable on a
+    # pipeline this deep — diagnosing the reranker by grepping log files is the
+    # alternative.
+    #
+    # OFF by default and deliberately so: tracing ships prompts and retrieved
+    # document text to a third-party service. Fine for public filings, a
+    # decision worth making consciously for user uploads.
+    # Requires LANGSMITH_API_KEY; the SDK reads it from the environment.
+    langsmith_tracing: bool = False
+    langsmith_project: str = "pagesense"
+    # Declared here so the value in .env is loaded rather than dropped by
+    # extra="ignore". The SDK reads it from os.environ, so it has to be exported
+    # explicitly — see configure_langsmith_env().
+    langsmith_api_key: str | None = None
+
     # ── LangGraph agentic pipeline ────────────────────────────────────────────
     # When enabled, POST /query and the eval harness route through rag/graph.py
     # (LangGraph) instead of the linear rag/qa.py pipeline. The graph adds two

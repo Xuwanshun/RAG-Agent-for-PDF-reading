@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any, TypeVar
 
 from openai import (
@@ -32,10 +33,62 @@ logger = logging.getLogger(__name__)
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
 
+def configure_langsmith_env(settings: Settings) -> None:
+    """
+    Export LangSmith configuration into os.environ.
+
+    pydantic-settings loads .env into Settings, but the langsmith SDK and
+    LangGraph's tracing callbacks read os.environ directly — nothing bridges the
+    two. Without this, a perfectly valid key sitting in .env never reaches the
+    SDK and the service answers 401, which looks indistinguishable from a
+    revoked key.
+
+    Uses setdefault so an explicitly exported variable always beats .env.
+    """
+    if not getattr(settings, "langsmith_tracing", False):
+        return
+    os.environ.setdefault("LANGSMITH_TRACING", "true")
+    os.environ.setdefault("LANGSMITH_PROJECT", settings.langsmith_project)
+    api_key = getattr(settings, "langsmith_api_key", None)
+    if api_key:
+        os.environ.setdefault("LANGSMITH_API_KEY", api_key)
+    else:
+        logger.warning("LANGSMITH_TRACING is on but no LANGSMITH_API_KEY is set; traces will not be recorded")
+
+
+def maybe_trace_client(client: Any, settings: Settings) -> Any:
+    """
+    Wrap an OpenAI client for LangSmith tracing when it is switched on.
+
+    Returns the client untouched when tracing is disabled, when the SDK is
+    absent, or when wrapping fails for any reason: observability must never be
+    the reason a query stops working. Failures are logged, not raised.
+    """
+    if not getattr(settings, "langsmith_tracing", False):
+        return client
+    try:
+        from langsmith.wrappers import wrap_openai
+
+        configure_langsmith_env(settings)
+        return wrap_openai(client)
+    except Exception as exc:  # noqa: BLE001 - tracing is strictly best-effort
+        logger.warning("LangSmith tracing unavailable, continuing untraced: %s", exc)
+        return client
+
+
 class OpenAIJSONModelClient:
-    def __init__(self, *, model: str, api_key: str, base_url: str | None) -> None:
+    def __init__(
+        self,
+        *,
+        model: str,
+        api_key: str,
+        base_url: str | None,
+        settings: Settings | None = None,
+    ) -> None:
         self.model = model
-        self.client = OpenAI(api_key=api_key, base_url=base_url)
+        client = OpenAI(api_key=api_key, base_url=base_url)
+        # Traced only when explicitly enabled; a no-op otherwise.
+        self.client = maybe_trace_client(client, settings) if settings is not None else client
 
     def generate_structured(self, *, system_prompt: str, user_prompt: str, response_model: type[ModelT]) -> ModelT:
         try:
@@ -93,6 +146,7 @@ def build_openai_client(settings: Settings) -> OpenAIJSONModelClient:
         model=settings.openai_model,
         api_key=settings.openai_api_key,
         base_url=settings.openai_base_url,
+        settings=settings,
     )
 
 
