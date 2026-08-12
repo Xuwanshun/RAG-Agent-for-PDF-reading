@@ -191,6 +191,22 @@ class Settings(BaseSettings):
     # Adds two LLM API calls per query when issues are found; disable in tests.
     use_faithfulness_check: bool = False
 
+    # ── OCR models (scanned documents only) ───────────────────────────────────
+    # Only used when a PDF has no usable text layer; born-digital PDFs never
+    # reach PaddleOCR at all.
+    #
+    # Defaults track the current generation. paddleocr 3.7 ships PP-OCRv6_medium
+    # as its own default; the code previously pinned PP-OCRv4_mobile, two
+    # generations behind and the smallest tier available. Published gains are
+    # ~+13pp end-to-end for v5 over v4, plus a further +4.6% detection and
+    # +5.1% recognition for v6_medium over v5_server.
+    #
+    # Cost of the upgrade: ~16 MB -> ~132 MB of model weights in the image, and
+    # slower inference. Set these back to PP-OCRv4_mobile_* if image size or CPU
+    # time matters more than accuracy for your deployment.
+    ocr_detection_model: str = "PP-OCRv6_medium_det"
+    ocr_recognition_model: str = "PP-OCRv6_medium_rec"
+
     # ── LangSmith tracing ─────────────────────────────────────────────────────
     # When enabled, every OpenAI call is traced to LangSmith, giving a
     # stage-by-stage waterfall per query (retrieve -> rerank -> compress ->

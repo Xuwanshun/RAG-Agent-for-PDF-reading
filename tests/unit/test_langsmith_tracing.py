@@ -12,7 +12,22 @@ from __future__ import annotations
 import os
 from unittest.mock import MagicMock, patch
 
-from document_process.clients import configure_langsmith_env, maybe_trace_client
+import pytest
+
+from document_process.clients import configure_langsmith_env, configure_openai_env, maybe_trace_client
+
+
+@pytest.fixture(autouse=True)
+def _isolate_environment(monkeypatch):
+    """
+    Give each test its own os.environ.
+
+    These tests exercise functions whose whole job is to WRITE to the
+    environment, and monkeypatch.delenv registers no restore for a variable that
+    was already absent — so a value set during the test outlived it and leaked
+    into unrelated tests (test_vlm.py started failing only when run together).
+    """
+    monkeypatch.setattr(os, "environ", dict(os.environ))
 
 
 def test_client_is_returned_unchanged_when_tracing_is_disabled(tmp_settings):
@@ -103,3 +118,42 @@ def test_tracing_without_a_key_does_not_export_a_blank_key(tmp_settings, monkeyp
     configure_langsmith_env(settings)
 
     assert "LANGSMITH_API_KEY" not in os.environ
+
+
+# ── the same bridge, for any SDK that reads os.environ ────────────────────────
+# RAGAS reads OPENAI_API_KEY from the environment and failed with "Missing
+# credentials" while a valid key sat in Settings. Identical cause to the
+# LangSmith 401: pydantic-settings loads .env into an object, not into the
+# process environment. Any third-party SDK we add will hit this.
+
+
+def test_openai_key_is_exported_for_sdks_that_read_the_environment(tmp_settings, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    configure_openai_env(tmp_settings)
+
+    assert os.environ["OPENAI_API_KEY"] == tmp_settings.openai_api_key
+
+
+def test_an_existing_openai_key_in_the_environment_wins(tmp_settings, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-from-shell")
+
+    configure_openai_env(tmp_settings)
+
+    assert os.environ["OPENAI_API_KEY"] == "sk-from-shell"
+
+
+def test_no_key_exports_nothing_rather_than_a_blank(tmp_settings, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    configure_openai_env(tmp_settings(openai_api_key=None))
+
+    assert "OPENAI_API_KEY" not in os.environ
+
+
+def test_base_url_is_exported_when_set(tmp_settings, monkeypatch):
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+
+    configure_openai_env(tmp_settings(openai_base_url="https://proxy.example/v1"))
+
+    assert os.environ["OPENAI_BASE_URL"] == "https://proxy.example/v1"

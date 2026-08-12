@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from config import Settings
+from document_process.clients import configure_openai_env
 from eval.evaluators import score_retrieval
 from eval.provenance import run_metadata
 from rag.dispatch import answer_question
@@ -123,10 +124,20 @@ def score_generation(results: list[QuestionResult], settings: Settings) -> dict[
     try:
         from ragas import evaluate
         from ragas.dataset_schema import EvaluationDataset, SingleTurnSample
-        from ragas.metrics import answer_relevancy, faithfulness
+
+        # NB: evaluate() takes the module-level metric singletons from
+        # ragas.metrics. The ragas.metrics.collections classes are a separate
+        # execution API and evaluate() rejects them ("All metrics must be
+        # initialised metric objects"), so the DeprecationWarning here is
+        # expected until that migration is done properly.
+        from ragas.metrics import faithfulness
     except ImportError:
         logger.warning("ragas not installed; skipping generation metrics")
         return {}
+
+    # RAGAS looks OPENAI_API_KEY up in the environment rather than accepting it
+    # from us, and pydantic-settings never puts it there.
+    configure_openai_env(settings)
 
     usable = [r for r in results if r.answer and r.retrieved_texts]
     if not usable:
@@ -144,10 +155,17 @@ def score_generation(results: list[QuestionResult], settings: Settings) -> dict[
     ]
 
     try:
-        scored = evaluate(EvaluationDataset(samples=samples), metrics=[faithfulness, answer_relevancy])
+        # answer_relevancy is deliberately omitted: it builds its own
+        # langchain OpenAIEmbeddings internally, which lacks embed_query under
+        # the langchain-community<0.4 pin that ragas itself requires, so it
+        # returns nan. Passing an embedder to evaluate() does not override it.
+        # faithfulness is the metric that matters here anyway — it is what
+        # detects an answer asserting figures the retrieved text does not
+        # support, which retrieval metrics are structurally blind to.
+        scored = evaluate(EvaluationDataset(samples=samples), metrics=[faithfulness])
         return {name: float(value) for name, value in scored._repr_dict.items()}
     except Exception as exc:  # noqa: BLE001 - generation metrics are not worth aborting a run
-        logger.warning("RAGAS scoring failed: %s", exc)
+        logger.warning("RAGAS scoring failed: %s: %s", type(exc).__name__, exc)
         return {}
 
 

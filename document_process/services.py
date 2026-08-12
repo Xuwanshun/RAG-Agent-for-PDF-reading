@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -320,6 +321,11 @@ def _extract_pdf_text_layer(
 
 
 class OCRService:
+    def __init__(self, settings: Settings | None = None) -> None:
+        # Only needed to pick the OCR models and to label their output; a scan
+        # is the sole case where any of it runs.
+        self.settings = settings
+
     def extract(
         self,
         pages: list[PageContext],
@@ -364,7 +370,7 @@ class OCRService:
 
             if ocr is None:
                 logger.info("Running PaddleOCR text extraction (no usable text layer)")
-                ocr = _get_paddle_ocr()
+                ocr = _get_paddle_ocr(self.settings)
             try:
                 payload = ocr.predict(str(page.page_image_path))[0].json["res"]
             except Exception as exc:
@@ -412,7 +418,7 @@ class OCRService:
                     width=page.width,
                     height=page.height,
                     items=items,
-                    text_source="paddleocr_ppocrv5_mobile",
+                    text_source=(ocr_text_source_label(self.settings) if self.settings else "paddleocr"),
                     page_image_path=str(page.page_image_path),
                 )
             )
@@ -1035,8 +1041,28 @@ def _load_image_page(path: Path, *, page_number: int) -> PageContext:
     return PageContext(page_number=page_number, width=float(width), height=float(height), page_image_path=path)
 
 
+def ocr_text_source_label(settings: Settings) -> str:
+    """
+    Provenance label recording which OCR models produced a page's text.
+
+    Derived from the configured model names rather than hardcoded: the previous
+    literal claimed "ppocrv5_mobile" while PP-OCRv4_mobile actually ran, so every
+    stored artifact misreported its own model version.
+    """
+
+    def _version(name: str) -> str:
+        match = re.search(r"v(\d+)[_-]?(\w+?)(?:_(?:det|rec))?$", name)
+        return f"v{match.group(1)}_{match.group(2)}" if match else name.lower()
+
+    detection = _version(settings.ocr_detection_model)
+    recognition = _version(settings.ocr_recognition_model)
+    if detection == recognition:
+        return f"paddleocr_{detection}"
+    return f"paddleocr_det-{detection}_rec-{recognition}"
+
+
 @lru_cache(maxsize=1)
-def _get_paddle_ocr() -> Any:
+def _get_paddle_ocr(settings: Settings | None = None) -> Any:
     from paddleocr import PaddleOCR
 
     # enable_mkldnn=False: workaround for PaddlePaddle 3.3.x regression (issue #77340).
@@ -1048,8 +1074,8 @@ def _get_paddle_ocr() -> Any:
         use_doc_orientation_classify=False,
         use_doc_unwarping=False,
         use_textline_orientation=False,
-        text_detection_model_name="PP-OCRv4_mobile_det",
-        text_recognition_model_name="PP-OCRv4_mobile_rec",
+        text_detection_model_name=(settings.ocr_detection_model if settings else "PP-OCRv6_medium_det"),
+        text_recognition_model_name=(settings.ocr_recognition_model if settings else "PP-OCRv6_medium_rec"),
         enable_mkldnn=False,
         # Pin the detection input size. Without this, unusual page dimensions
         # after PaddleOCR's internal resize can trigger a crash in PaddlePaddle's

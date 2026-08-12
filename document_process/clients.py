@@ -33,6 +33,27 @@ logger = logging.getLogger(__name__)
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
 
+def configure_openai_env(settings: Settings) -> None:
+    """
+    Export OpenAI credentials into os.environ for SDKs that read them there.
+
+    Our own client is constructed with an explicit api_key, so this is only
+    needed for third-party libraries that look the key up themselves — RAGAS
+    being the case in hand, which failed with "Missing credentials" while a valid
+    key sat in Settings.
+
+    Same root cause as configure_langsmith_env: pydantic-settings loads .env into
+    an object, not into the process environment. Any SDK added later will hit it,
+    so call this before handing work to one.
+
+    Uses setdefault so an explicitly exported variable always wins.
+    """
+    if settings.openai_api_key:
+        os.environ.setdefault("OPENAI_API_KEY", settings.openai_api_key)
+    if settings.openai_base_url:
+        os.environ.setdefault("OPENAI_BASE_URL", settings.openai_base_url)
+
+
 def configure_langsmith_env(settings: Settings) -> None:
     """
     Export LangSmith configuration into os.environ.
