@@ -108,6 +108,18 @@ class CroppedRegionAsset(BaseModel):
     bbox: BoundingBox
 
 
+class TableStructure(BaseModel):
+    table_id: str
+    region_id: str
+    asset_id: str | None = None
+    page_number: int
+    crop_path: str
+    html: str
+    cell_count: int = 0
+    source: str = "PP-TableRecognitionV2"
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 class VisualRegionSummary(BaseModel):
     summary_id: str
     region_id: str
@@ -150,6 +162,7 @@ class ProcessingMetadata(BaseModel):
     ocr_engine: str
     reading_order_model: str
     layout_detection_model: str
+    block_layout_model: str | None = None
     agent_model: str | None = None
     confidence_summary: dict[str, Any] = Field(default_factory=dict)
     warnings: list[ProcessingIssue] = Field(default_factory=list)

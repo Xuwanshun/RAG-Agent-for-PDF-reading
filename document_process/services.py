@@ -50,6 +50,7 @@ from document_process.models import (
     ProcessingIssue,
     ProcessingMetadata,
     RegionAssociation,
+    TableStructure,
     VisualRegionSummary,
 )
 
@@ -447,14 +448,20 @@ class ReadingOrderService:
     def _resolve_bbox_sort(self, pages: list[OCRPageResult]) -> tuple[dict[str, Any], list[ProcessingIssue]]:
         ordered_text: list[dict[str, Any]] = []
         all_ids: list[str] = []
+        resolvers: set[str] = set()
         for page in pages:
-            ordered_items = sorted(page.items, key=_reading_order_key)
+            ordered_items = _order_page_items(page)
+            resolvers.add(_page_order_source(page))
             for index, item in enumerate(ordered_items, start=1):
                 item.reading_order = index
             ids = [item.item_id for item in ordered_items]
             all_ids.extend(ids)
             ordered_text.append({"page_number": page.page_number, "ordered_item_ids": ids})
-        return {"resolver": "ocr_bbox_sort_v1", "document_order_item_ids": all_ids, "pages": ordered_text}, []
+        return {
+            "resolver": _resolver_label(resolvers),
+            "document_order_item_ids": all_ids,
+            "pages": ordered_text,
+        }, []
 
     # ── LayoutReader (LayoutLMv3) ─────────────────────────────────────────────
 
@@ -486,6 +493,15 @@ class ReadingOrderService:
             items = page.items
             if not items:
                 ordered_text.append({"page_number": page.page_number, "ordered_item_ids": []})
+                continue
+
+            if _page_is_already_ordered(page):
+                ordered_items = list(items)
+                for index, item in enumerate(ordered_items, start=1):
+                    item.reading_order = index
+                ids = [item.item_id for item in ordered_items]
+                all_ids.extend(ids)
+                ordered_text.append({"page_number": page.page_number, "ordered_item_ids": ids})
                 continue
 
             try:
@@ -529,7 +545,6 @@ class LayoutDetectionService:
         layout_detector = _get_paddle_layout_detector()
         regions: list[LayoutRegion] = []
         issues: list[ProcessingIssue] = []
-        next_id = 1
         type_counts = {"text_block": 0, "table": 0, "figure": 0}
 
         for page in pages:
@@ -542,6 +557,13 @@ class LayoutDetectionService:
 
             page_regions: list[LayoutRegion] = []
             skipped_labels: dict[str, int] = {}
+            # Numbered within the page and prefixed with it, the way item and
+            # block IDs already are. A counter spanning the whole call restarts
+            # on every batch — the pipeline calls detect() once per batch — so
+            # the same name gets minted several times per document, and the
+            # duplicates then overwrite each other in the region lookups and in
+            # the crop filenames.
+            next_index = 1
             for box in payload.get("boxes") or []:
                 label = str(box.get("label") or "").strip().lower()
                 region_type = _region_type_for_label(label)
@@ -552,7 +574,7 @@ class LayoutDetectionService:
                 if bbox is None or not bbox.is_valid():
                     continue
                 region = LayoutRegion(
-                    region_id=f"region_{next_id}",
+                    region_id=f"p{page.page_number}_region_{next_index}",
                     region_type=region_type,
                     page_number=page.page_number,
                     bbox=bbox,
@@ -565,7 +587,7 @@ class LayoutDetectionService:
                 )
                 page_regions.append(region)
                 type_counts[region_type] += 1
-                next_id += 1
+                next_index += 1
 
             logger.info(
                 "Page %s layout regions: text_blocks=%s tables=%s figures=%s skipped=%s",
@@ -595,6 +617,54 @@ class LayoutDetectionService:
         return _dedupe_regions(regions), issues, "PP-DocLayout_plus-L"
 
 
+class BlockLayoutService:
+    """
+    Paragraph-level block boxes from PP-DocBlockLayout.
+
+    PP-DocLayout_plus-L answers "what kind of region is this" (table, header,
+    body text). PP-DocBlockLayout answers "where does one block of running text
+    begin and end", which is what block grouping actually needs. The heuristic
+    it replaces bucketed y0 into 20px bands, which on the text-layer path put
+    every line in its own block (10,587 blocks from 10,975 items across a
+    12-document corpus) — so each line became its own paragraph and chunk text
+    ended up as lines joined by blank lines.
+    """
+
+    def detect(self, pages: list[PageContext]) -> tuple[dict[int, list[BoundingBox]], list[ProcessingIssue], str]:
+        logger.info("Running PP-DocBlockLayout block detection on %s page(s)", len(pages))
+        detector = _get_paddle_block_layout_detector()
+        by_page: dict[int, list[BoundingBox]] = {}
+        issues: list[ProcessingIssue] = []
+
+        for page in pages:
+            try:
+                payload = detector.predict(str(page.page_image_path))[0].json["res"]
+            except Exception as exc:
+                # A page without block boxes falls back to the line heuristic
+                # rather than failing the document.
+                issues.append(
+                    ProcessingIssue(
+                        code="block_layout_failed",
+                        message=f"PP-DocBlockLayout failed on page {page.page_number}: {exc}",
+                        level="warning",
+                        page_number=page.page_number,
+                    )
+                )
+                logger.warning("Block layout failed on page %s: %s", page.page_number, exc)
+                continue
+
+            boxes: list[BoundingBox] = []
+            for box in payload.get("boxes") or []:
+                bbox = _bbox_from_layout_box(box.get("coordinate"))
+                if bbox is not None and bbox.is_valid():
+                    boxes.append(bbox)
+            boxes.sort(key=lambda b: (b.y0, b.x0))
+            by_page[page.page_number] = boxes
+            logger.info("Page %s block regions: %s", page.page_number, len(boxes))
+
+        return by_page, issues, "PP-DocBlockLayout"
+
+
 class AssociationService:
     def associate(
         self,
@@ -603,6 +673,7 @@ class AssociationService:
         regions: list[LayoutRegion],
         *,
         start_index: int = 1,
+        block_boxes: dict[int, list[BoundingBox]] | None = None,
     ) -> tuple[list[RegionAssociation], list[OrderedTextBlock], dict[str, Any]]:
         item_lookup = {item.item_id: item for page in ocr_pages for item in page.items}
         regions_by_page: dict[int, list[LayoutRegion]] = {}
@@ -624,15 +695,14 @@ class AssociationService:
             ]
             page_regions = regions_by_page.get(page_number, [])
             page_text_regions = text_regions_by_page.get(page_number, [])
+            page_block_boxes = (block_boxes or {}).get(page_number) or []
             page_blocks: list[OrderedTextBlock] = []
             current_items: list[OCRTextItem] = []
-            current_region_id: str | None = None
-            current_line_bucket: int | None = None
+            current_key: tuple[Any, Any] | None = None
 
             for item in ordered_items:
                 matched_region, overlap_ratio = _best_region_match(item, page_regions)
                 item.region_id = matched_region.region_id if matched_region else None
-                line_bucket = int(item.bbox.y0 // 20)
                 associations.append(
                     RegionAssociation(
                         association_id=f"assoc_{len(associations) + 1}",
@@ -644,14 +714,13 @@ class AssociationService:
                     )
                 )
 
-                group_region_id = item.region_id
-                if current_items and (group_region_id != current_region_id or line_bucket != current_line_bucket):
+                key = _block_grouping_key(item, page_block_boxes)
+                if current_items and key != current_key:
                     global_index = _flush_block(page_number, current_items, global_index, page_blocks, ordered_blocks)
                     current_items = []
 
                 current_items.append(item)
-                current_region_id = group_region_id
-                current_line_bucket = line_bucket
+                current_key = key
 
             if current_items:
                 global_index = _flush_block(page_number, current_items, global_index, page_blocks, ordered_blocks)
@@ -782,6 +851,139 @@ class CroppingService:
         return assets, issues
 
 
+class TableStructureService:
+    """
+    Cell-level table structure for cropped table regions.
+
+    Layout detection gives a table's bounding box and nothing more, so a table
+    flattens into a sequence of row strings and the column a figure belongs to
+    is lost — a balance sheet becomes "Cash and cash equivalents $ 24,296
+    $ 30,242" with no record of which number is which period. Structure
+    recognition recovers the grid as HTML.
+
+    It re-crops tight to the region bbox rather than reusing the files
+    CroppingService writes. Those are padded for the vision model — 8% of height
+    per side on a table, which on a full-page balance sheet is ~46pt, close to
+    four lines of surrounding body text, and 21% of the saved crop's area. With
+    layout detection disabled the recogniser treats whatever it is given as one
+    table, so that padding would be read as extra rows. Padding helps a VLM see
+    context; it corrupts a cell grid.
+
+    Cost stays bounded to the table regions in a document (~50 for a 10-Q)
+    rather than every page.
+    """
+
+    def recognize(
+        self,
+        *,
+        pages: list[PageContext],
+        regions: list[LayoutRegion],
+        assets: list[CroppedRegionAsset] | None = None,
+    ) -> tuple[list[TableStructure], list[ProcessingIssue]]:
+        table_regions = [region for region in regions if region.region_type == "table"]
+        if not table_regions:
+            return [], []
+
+        try:
+            from PIL import Image  # type: ignore
+        except Exception as exc:
+            return [], [
+                ProcessingIssue(
+                    code="table_structure_unavailable",
+                    message="Pillow is required to crop tables for structure recognition.",
+                    level="warning",
+                    details={"error": str(exc)},
+                )
+            ]
+
+        logger.info("Running table structure recognition on %s table region(s)", len(table_regions))
+        recognizer = _get_paddle_table_recognizer()
+        page_lookup = {page.page_number: page for page in pages}
+        asset_by_region = {asset.region_id: asset for asset in (assets or [])}
+        structures: list[TableStructure] = []
+        issues: list[ProcessingIssue] = []
+
+        for region in table_regions:
+            asset = asset_by_region.get(region.region_id)
+            page = page_lookup.get(region.page_number)
+            if page is None or not page.page_image_path.exists():
+                issues.append(
+                    ProcessingIssue(
+                        code="table_page_image_missing",
+                        message="Skipping table structure because the rendered page image is missing.",
+                        level="warning",
+                        page_number=region.page_number,
+                        details={"region_id": region.region_id},
+                    )
+                )
+                continue
+            try:
+                with Image.open(page.page_image_path) as image:
+                    box = (
+                        max(0, int(region.bbox.x0)),
+                        max(0, int(region.bbox.y0)),
+                        min(image.width, int(region.bbox.x1)),
+                        min(image.height, int(region.bbox.y1)),
+                    )
+                    if box[2] - box[0] < 16 or box[3] - box[1] < 16:
+                        continue
+                    payload = recognizer.predict(_to_predict_input(image.crop(box)))[0].json["res"]
+            except Exception as exc:
+                # One unreadable table must not fail the document.
+                issues.append(
+                    ProcessingIssue(
+                        code="table_structure_failed",
+                        message=f"Table structure recognition failed for {region.region_id}: {exc}",
+                        level="warning",
+                        page_number=region.page_number,
+                        details={"region_id": region.region_id},
+                    )
+                )
+                logger.warning("Table structure failed for %s: %s", region.region_id, exc)
+                continue
+
+            entries = payload.get("table_res_list") or []
+            if not entries:
+                issues.append(
+                    ProcessingIssue(
+                        code="table_structure_empty",
+                        message=f"No table structure returned for {region.region_id}.",
+                        level="warning",
+                        page_number=region.page_number,
+                        details={"region_id": region.region_id},
+                    )
+                )
+                continue
+
+            # The crop is one table by construction, so take the first result and
+            # record the count when the model disagrees.
+            entry = entries[0]
+            html = str(entry.get("pred_html") or "").strip()
+            if not html:
+                continue
+            cells = entry.get("cell_box_list") or []
+            structures.append(
+                TableStructure(
+                    table_id=f"table_{region.region_id}",
+                    region_id=region.region_id,
+                    asset_id=asset.asset_id if asset else None,
+                    page_number=region.page_number,
+                    # The padded crop is what a reader/VLM should look at; the
+                    # structure below was read from a tight re-crop.
+                    crop_path=asset.crop_path if asset else str(page.page_image_path),
+                    html=html,
+                    cell_count=len(cells),
+                    metadata={
+                        "tables_detected_in_crop": len(entries),
+                        "cropped_tight_to_region": True,
+                    },
+                )
+            )
+            logger.info("Table structure for %s: %s cell(s)", region.region_id, len(cells))
+
+        return structures, issues
+
+
 def build_chunks(
     *,
     document_id: str,
@@ -823,6 +1025,7 @@ def build_document_artifacts(
     reading_order_model: str,
     layout_detection_model: str,
     issues: list[ProcessingIssue],
+    block_layout_model: str | None = None,
 ) -> tuple[ProcessedDocument, ProcessingMetadata]:
     warnings = [issue for issue in issues if issue.level == "warning"]
     errors = [issue for issue in issues if issue.level == "error"]
@@ -862,6 +1065,7 @@ def build_document_artifacts(
         ocr_engine="PaddleOCR",
         reading_order_model=reading_order_model,
         layout_detection_model=layout_detection_model,
+        block_layout_model=block_layout_model,
         agent_model=None,
         confidence_summary=_confidence_summary(ocr_pages=ocr_pages, regions=regions, chunks=chunks),
         warnings=warnings,
@@ -876,8 +1080,10 @@ def build_visual_summaries(
     ordered_blocks: list[OrderedTextBlock],
     chunks: list[ProcessedChunk],
     cropped_assets: list[CroppedRegionAsset],
+    table_structures: list[TableStructure] | None = None,
 ) -> list[VisualRegionSummary]:
     asset_by_region = {asset.region_id: asset for asset in cropped_assets}
+    structure_by_region = {structure.region_id: structure for structure in (table_structures or [])}
     chunks_by_region: dict[str, list[ProcessedChunk]] = {}
     for chunk in chunks:
         for region_id in chunk.source_region_ids:
@@ -904,9 +1110,17 @@ def build_visual_summaries(
         region_chunks = chunks_by_region.get(region.region_id, [])
         block_text = " ".join(block.text for block in overlapping_blocks if block.text.strip()).strip()
         chunk_text = " ".join(chunk.text for chunk in region_chunks if chunk.text.strip()).strip()
-        summary_text = (
-            block_text or chunk_text or f"Detected {region.region_type} region on page {region.page_number}."
-        )[:1200]
+        # Recovered cell structure beats the flattened row strings: it is the
+        # only form that records which column a figure belongs to. Markup needs
+        # a wider cap than prose — a balance sheet's HTML runs past 1200 chars
+        # and truncating mid-tag would leave it unparseable.
+        structure = structure_by_region.get(region.region_id)
+        if structure and structure.html:
+            summary_text = structure.html[:4000]
+        else:
+            summary_text = (
+                block_text or chunk_text or f"Detected {region.region_type} region on page {region.page_number}."
+            )[:1200]
         asset = asset_by_region.get(region.region_id)
         summaries.append(
             VisualRegionSummary(
@@ -922,6 +1136,15 @@ def build_visual_summaries(
                 metadata={
                     "label": region.metadata.get("label"),
                     "detector": region.metadata.get("detector"),
+                    **(
+                        {
+                            "table_html": structure.html,
+                            "cell_count": structure.cell_count,
+                            "structure_source": structure.source,
+                        }
+                        if structure
+                        else {}
+                    ),
                 },
             )
         )
@@ -940,6 +1163,7 @@ def export_artifacts(
     cropped_assets: list[CroppedRegionAsset],
     visual_summaries: list[VisualRegionSummary],
     chunks: list[ProcessedChunk],
+    table_structures: list[TableStructure] | None = None,
     document: ProcessedDocument,
     metadata: ProcessingMetadata,
     descriptor: dict[str, Any] | None = None,
@@ -965,6 +1189,7 @@ def export_artifacts(
             "reading_order": "reading_order.json",
             "cropped_assets": "cropped_assets.json",
             "visual_summaries": "visual_summaries.json",
+            "table_structures": "table_structures.json",
             "chunks": "chunks.json",
             "metadata": "metadata.json",
         },
@@ -988,6 +1213,10 @@ def export_artifacts(
     _write_json(working_dir / "cropped_assets.json", [asset.model_dump(mode="json") for asset in cropped_assets])
     _write_json(
         working_dir / "visual_summaries.json", [summary.model_dump(mode="json") for summary in visual_summaries]
+    )
+    _write_json(
+        working_dir / "table_structures.json",
+        [structure.model_dump(mode="json") for structure in (table_structures or [])],
     )
     doc_payload = document.model_dump(mode="json")
     if descriptor:
@@ -1061,8 +1290,23 @@ def ocr_text_source_label(settings: Settings) -> str:
     return f"paddleocr_det-{detection}_rec-{recognition}"
 
 
-@lru_cache(maxsize=1)
 def _get_paddle_ocr(settings: Settings | None = None) -> Any:
+    """
+    Build (or reuse) the PaddleOCR predictor for the configured models.
+
+    The cache is keyed on the model names rather than on Settings: Settings is a
+    pydantic model and is not hashable, so caching on it raised TypeError on
+    every call and no page ever reached the predictor. Keying on the names is
+    also more accurate — changing a model should yield a new predictor.
+    """
+    return _build_paddle_ocr(
+        settings.ocr_detection_model if settings else "PP-OCRv6_medium_det",
+        settings.ocr_recognition_model if settings else "PP-OCRv6_medium_rec",
+    )
+
+
+@lru_cache(maxsize=1)
+def _build_paddle_ocr(detection_model: str, recognition_model: str) -> Any:
     from paddleocr import PaddleOCR
 
     # enable_mkldnn=False: workaround for PaddlePaddle 3.3.x regression (issue #77340).
@@ -1074,8 +1318,8 @@ def _get_paddle_ocr(settings: Settings | None = None) -> Any:
         use_doc_orientation_classify=False,
         use_doc_unwarping=False,
         use_textline_orientation=False,
-        text_detection_model_name=(settings.ocr_detection_model if settings else "PP-OCRv6_medium_det"),
-        text_recognition_model_name=(settings.ocr_recognition_model if settings else "PP-OCRv6_medium_rec"),
+        text_detection_model_name=detection_model,
+        text_recognition_model_name=recognition_model,
         enable_mkldnn=False,
         # Pin the detection input size. Without this, unusual page dimensions
         # after PaddleOCR's internal resize can trigger a crash in PaddlePaddle's
@@ -1091,6 +1335,30 @@ def _get_paddle_layout_detector() -> Any:
 
     # Same enable_mkldnn=False workaround as _get_paddle_ocr above.
     return LayoutDetection(enable_mkldnn=False)
+
+
+@lru_cache(maxsize=1)
+def _get_paddle_table_recognizer() -> Any:
+    from paddleocr import TableRecognitionPipelineV2
+
+    # The crop is already a single table region, so layout detection inside the
+    # pipeline is redundant work; orientation and unwarping are for photographed
+    # pages and never apply to a crop of our own render.
+    return TableRecognitionPipelineV2(
+        use_layout_detection=False,
+        use_doc_orientation_classify=False,
+        use_doc_unwarping=False,
+    )
+
+
+@lru_cache(maxsize=1)
+def _get_paddle_block_layout_detector() -> Any:
+    from paddleocr import LayoutDetection
+
+    # Same LayoutDetection wrapper, different weights: PP-DocBlockLayout emits a
+    # single "Region" class marking block extents, where the default
+    # PP-DocLayout_plus-L emits typed regions (table, header, text).
+    return LayoutDetection(model_name="PP-DocBlockLayout", enable_mkldnn=False)
 
 
 def _bbox_from_ocr_payload(rec_boxes: list[Any], dt_polys: list[Any], index: int) -> BoundingBox | None:
@@ -1190,6 +1458,74 @@ def _parse_layout_logits(logits: Any, length: int) -> list[int]:
                 ret[idx] = orders[idx].pop()
 
     return ret
+
+
+def _best_block_index(item: OCRTextItem, block_boxes: list[BoundingBox]) -> int | None:
+    """Index of the block box covering most of this item, or None if none does."""
+    best_index = None
+    best_ratio = 0.0
+    item_area = item.bbox.area() or 1.0
+    for index, box in enumerate(block_boxes):
+        ratio = item.bbox.intersection_area(box) / item_area
+        if ratio > best_ratio:
+            best_index = index
+            best_ratio = ratio
+    return best_index
+
+
+def _block_grouping_key(item: OCRTextItem, block_boxes: list[BoundingBox]) -> tuple[Any, Any]:
+    """
+    Key that consecutive items must share to land in the same text block.
+
+    With PP-DocBlockLayout boxes available, the block box is the grouping unit,
+    so a paragraph's lines merge into one block. Items covered by no box (page
+    headers, stray marginalia) each get a unique key so they stay separate
+    rather than silently merging into a neighbour.
+
+    Without block boxes — no Paddle, or the model failed on this page — this
+    falls back to the previous 20px line bucket, which yields one block per line.
+    """
+    if not block_boxes:
+        return (item.region_id, int(item.bbox.y0 // 20))
+    block_index = _best_block_index(item, block_boxes)
+    if block_index is None:
+        return (item.region_id, f"unblocked:{item.item_id}")
+    return (item.region_id, block_index)
+
+
+def _page_is_already_ordered(page: OCRPageResult) -> bool:
+    """
+    True when the page's items arrive in reading order and must not be re-sorted.
+
+    Text-layer pages do: _group_rects_into_lines returns line boxes sorted
+    top-to-bottom and each item is a whole line, so the sequence is already
+    correct. Re-sorting them measurably *degrades* it — the 18px bucket in
+    _reading_order_key collapses vertically-adjacent table rows into one band
+    and the x tiebreak then swaps them, which on a 12-document corpus produced
+    45 inversions of genuinely stacked lines against 2 correct merges.
+
+    OCR pages are different: PaddleOCR emits sub-line fragments in detector
+    order, roughly 3x as many items per page, and those do need sorting.
+    """
+    return page.text_source == "pdf_text_layer"
+
+
+def _page_order_source(page: OCRPageResult) -> str:
+    return "pdf_text_layer_order_v1" if _page_is_already_ordered(page) else "ocr_bbox_sort_v1"
+
+
+def _resolver_label(resolvers: set[str]) -> str:
+    if not resolvers:
+        return "ocr_bbox_sort_v1"
+    if len(resolvers) == 1:
+        return next(iter(resolvers))
+    return "mixed:" + "+".join(sorted(resolvers))
+
+
+def _order_page_items(page: OCRPageResult) -> list[OCRTextItem]:
+    if _page_is_already_ordered(page):
+        return list(page.items)
+    return sorted(page.items, key=_reading_order_key)
 
 
 def _reading_order_key(item: OCRTextItem) -> tuple[int, float, float]:
@@ -1377,6 +1713,17 @@ def _compute_crop_box(region: LayoutRegion, image_width: int, image_height: int)
         logger.info("Skipping crop for %s because padded crop was too small", region.region_id)
         return None
     return (left, top, right, bottom)
+
+
+def _to_predict_input(image: Any) -> Any:
+    """
+    Hand a PIL crop to a PaddleX predictor without a disk round-trip.
+
+    Predictors take a BGR ndarray; PIL is RGB, so the channels are reversed.
+    """
+    import numpy as np
+
+    return np.asarray(image.convert("RGB"))[:, :, ::-1]
 
 
 def _write_json(path: Path, payload: object) -> None:

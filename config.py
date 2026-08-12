@@ -120,6 +120,13 @@ class Settings(BaseSettings):
     # Cost note: one API call per detected table/figure region per document.
     # A 20-page report with 5 tables and 3 figures = 8 vision calls.
     use_vlm_summaries: bool = False
+
+    # When enabled, runs PP-TableRecognitionPipelineV2 over the cropped table
+    # regions to recover cell structure as HTML. Layout detection only gives a
+    # table's bounding box, so without this a table flattens into row strings
+    # and the column a figure belongs to is lost. Bounded to the table crops in
+    # a document rather than every page.
+    use_table_structure: bool = False
     vlm_model: str = "gpt-4o"
 
     # Self-hosted VLM via Modal (optional).

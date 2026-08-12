@@ -687,3 +687,356 @@ def test_ocr_extract_calls_on_page_done_once_per_page():
             svc.extract(pages, on_page_done=callback)
 
         assert callback.call_count == 2
+
+
+class TestLayoutDetectionRegionIds:
+    """Region IDs must be unique across the whole document, not per detect() call.
+
+    The pipeline calls detect() once per page batch, so an ID counter that is
+    local to detect() restarts every batch and mints the same name several
+    times. Colliding IDs silently overwrite each other in the region lookups
+    and in the crop filenames.
+    """
+
+    @staticmethod
+    def _pages(page_numbers: list[int], directory: Path) -> list[PageContext]:
+        pages = []
+        for number in page_numbers:
+            image = directory / f"page_{number}.png"
+            image.write_bytes(b"fake")
+            pages.append(PageContext(page_number=number, width=100.0, height=200.0, page_image_path=image))
+        return pages
+
+    @staticmethod
+    def _predictor(boxes_per_page: int) -> MagicMock:
+        result = MagicMock()
+        result.json = {
+            "res": {
+                "boxes": [
+                    {"label": "table", "coordinate": [0, 20 * i, 100, 20 * i + 15], "score": 0.9}
+                    for i in range(boxes_per_page)
+                ]
+            }
+        }
+        predictor = MagicMock()
+        predictor.predict.return_value = [result]
+        return predictor
+
+    def test_region_ids_unique_across_batches(self):
+        from document_process.services import LayoutDetectionService
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            service = LayoutDetectionService()
+            predictor = self._predictor(boxes_per_page=3)
+
+            with patch("document_process.services._get_paddle_layout_detector", return_value=predictor):
+                first, _, _ = service.detect(self._pages([1, 2], path), [])
+                second, _, _ = service.detect(self._pages([3, 4], path), [])
+
+            all_ids = [region.region_id for region in first + second]
+            assert len(all_ids) == len(set(all_ids)), f"duplicate region ids across batches: {all_ids}"
+
+    def test_region_ids_unique_within_a_batch(self):
+        from document_process.services import LayoutDetectionService
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            service = LayoutDetectionService()
+
+            with patch(
+                "document_process.services._get_paddle_layout_detector",
+                return_value=self._predictor(boxes_per_page=3),
+            ):
+                regions, _, _ = service.detect(self._pages([1, 2, 3], path), [])
+
+            ids = [region.region_id for region in regions]
+            assert len(ids) == len(set(ids))
+
+
+class TestPaddleOcrPredictorCache:
+    """The predictor cache must key on something hashable.
+
+    `_get_paddle_ocr` is lru_cached, so its argument has to be hashable.
+    Settings is a pydantic model and is not, which means every call raises
+    TypeError before the predictor is ever built. Passing None (as the unit
+    tests did) hides it, because None is hashable — but the pipeline always
+    constructs OCRService with a real Settings.
+    """
+
+    def test_predictor_is_built_from_real_settings(self):
+        from config import Settings
+        from document_process.services import _build_paddle_ocr, _get_paddle_ocr
+
+        _build_paddle_ocr.cache_clear()
+        with patch("paddleocr.PaddleOCR", return_value=MagicMock()) as paddle_ocr:
+            _get_paddle_ocr(Settings())
+
+        assert paddle_ocr.call_count == 1
+        kwargs = paddle_ocr.call_args.kwargs
+        assert kwargs["text_detection_model_name"] == Settings().ocr_detection_model
+        assert kwargs["text_recognition_model_name"] == Settings().ocr_recognition_model
+
+    def test_predictor_is_reused_for_the_same_models(self):
+        from config import Settings
+        from document_process.services import _build_paddle_ocr, _get_paddle_ocr
+
+        _build_paddle_ocr.cache_clear()
+        with patch("paddleocr.PaddleOCR", return_value=MagicMock()) as paddle_ocr:
+            first = _get_paddle_ocr(Settings())
+            second = _get_paddle_ocr(Settings())
+
+        assert first is second
+        assert paddle_ocr.call_count == 1, "predictor rebuilt despite identical model names"
+
+    def test_changing_models_builds_a_new_predictor(self):
+        from config import Settings
+        from document_process.services import _build_paddle_ocr, _get_paddle_ocr
+
+        _build_paddle_ocr.cache_clear()
+        with patch("paddleocr.PaddleOCR", side_effect=lambda **_: MagicMock()) as paddle_ocr:
+            _get_paddle_ocr(Settings(ocr_detection_model="PP-OCRv4_mobile_det"))
+            _get_paddle_ocr(Settings(ocr_detection_model="PP-OCRv5_mobile_det"))
+
+        assert paddle_ocr.call_count == 2
+
+
+class TestTextLayerReadingOrder:
+    """Text-layer pages arrive in reading order and must not be re-sorted.
+
+    _group_rects_into_lines already returns line boxes top-to-bottom and each
+    item is a whole line. The bbox sort's 18px bucket collapses adjacent table
+    rows into one band and the x tiebreak then swaps them.
+    """
+
+    @staticmethod
+    def _page(text_source: str) -> OCRPageResult:
+        # Two stacked table rows 16px apart that both round into 18px bucket 11
+        # (190/18 -> 11, 206/18 -> 11). The lower row starts further left, so a
+        # bbox sort swaps them.
+        upper = _item("i1", "Intl 944 778", _bbox(120, 190, 700, 204))
+        lower = _item("i2", "WW 2,083 1,645", _bbox(100, 206, 700, 220))
+        return OCRPageResult(page_number=1, items=[upper, lower], text_source=text_source)
+
+    def test_text_layer_order_is_preserved(self):
+        page = self._page("pdf_text_layer")
+        result, _ = ReadingOrderService().resolve([page])
+        assert result["pages"][0]["ordered_item_ids"] == ["i1", "i2"]
+        assert result["resolver"] == "pdf_text_layer_order_v1"
+
+    def test_ocr_pages_are_still_sorted(self):
+        page = self._page("paddleocr")
+        result, _ = ReadingOrderService().resolve([page])
+        # The bbox sort swaps them — that behaviour is unchanged for OCR pages.
+        assert result["pages"][0]["ordered_item_ids"] == ["i2", "i1"]
+        assert result["resolver"] == "ocr_bbox_sort_v1"
+
+    def test_reading_order_index_is_assigned_on_text_layer_pages(self):
+        page = self._page("pdf_text_layer")
+        ReadingOrderService().resolve([page])
+        assert [i.reading_order for i in page.items] == [1, 2]
+
+    def test_mixed_document_reports_both_resolvers(self):
+        digital = self._page("pdf_text_layer")
+        scanned = self._page("paddleocr")
+        scanned.page_number = 2
+        result, _ = ReadingOrderService().resolve([digital, scanned])
+        assert result["resolver"] == "mixed:ocr_bbox_sort_v1+pdf_text_layer_order_v1"
+
+
+class TestBlockGroupingFromBlockBoxes:
+    """PP-DocBlockLayout boxes are the grouping unit for text blocks.
+
+    The 20px line bucket it replaces put every text-layer line in its own block,
+    so each line became its own paragraph and chunk text was lines joined by
+    blank lines.
+    """
+
+    @staticmethod
+    def _three_lines() -> list[OCRTextItem]:
+        return [
+            _item("i1", "This report includes estimates, projections,", _bbox(90, 100, 700, 118)),
+            _item("i2", "statements relating to our business plans", _bbox(90, 122, 700, 140)),
+            _item("i3", "and expected operating results.", _bbox(90, 144, 700, 162)),
+        ]
+
+    @staticmethod
+    def _resolve(items: list[OCRTextItem]) -> tuple[OCRPageResult, dict]:
+        page = OCRPageResult(page_number=1, items=items, text_source="pdf_text_layer")
+        order, _ = ReadingOrderService().resolve([page])
+        return page, order
+
+    def test_lines_in_one_block_box_merge_into_one_block(self):
+        items = self._three_lines()
+        page, order = self._resolve(items)
+        _, blocks, _ = AssociationService().associate([page], order, [], block_boxes={1: [_bbox(80, 90, 720, 175)]})
+        assert len(blocks) == 1
+        assert blocks[0].text == (
+            "This report includes estimates, projections, "
+            "statements relating to our business plans "
+            "and expected operating results."
+        )
+
+    def test_separate_block_boxes_stay_separate(self):
+        items = self._three_lines()
+        page, order = self._resolve(items)
+        _, blocks, _ = AssociationService().associate(
+            [page],
+            order,
+            [],
+            block_boxes={1: [_bbox(80, 90, 720, 141), _bbox(80, 142, 720, 175)]},
+        )
+        assert len(blocks) == 2
+        assert blocks[1].text == "and expected operating results."
+
+    def test_item_outside_every_block_box_stays_its_own_block(self):
+        items = self._three_lines()
+        items.insert(0, _item("hdr", "PART I", _bbox(500, 20, 560, 34)))
+        page, order = self._resolve(items)
+        _, blocks, _ = AssociationService().associate([page], order, [], block_boxes={1: [_bbox(80, 90, 720, 175)]})
+        assert len(blocks) == 2
+        assert blocks[0].text == "PART I"
+
+    def test_falls_back_to_line_bucket_without_block_boxes(self):
+        items = self._three_lines()
+        page, order = self._resolve(items)
+        _, blocks, _ = AssociationService().associate([page], order, [], block_boxes=None)
+        # Previous behaviour: one block per line.
+        assert len(blocks) == 3
+
+    def test_region_change_still_splits_within_one_block_box(self):
+        items = self._three_lines()
+        page, order = self._resolve(items)
+        regions = [
+            _region("r_table", "table", _bbox(80, 90, 720, 141)),
+            _region("r_text", "text_block", _bbox(80, 142, 720, 175)),
+        ]
+        _, blocks, _ = AssociationService().associate(
+            [page], order, regions, block_boxes={1: [_bbox(80, 90, 720, 175)]}
+        )
+        assert len(blocks) == 2
+        assert blocks[0].region_ids == ["r_table"]
+        assert blocks[1].region_ids == ["r_text"]
+
+
+class TestTableStructureService:
+    """Cell structure is recovered from the table crops already on disk.
+
+    Layout detection only yields a table's bounding box, so without this a
+    balance sheet flattens to row strings and the column a figure belongs to is
+    lost.
+    """
+
+    HTML = "<table><tr><td>Cash</td><td>24,296</td><td>30,242</td></tr></table>"
+
+    @staticmethod
+    def _predictor(table_res_list):
+        result = MagicMock()
+        result.json = {"res": {"table_res_list": table_res_list}}
+        predictor = MagicMock()
+        predictor.predict.return_value = [result]
+        return predictor
+
+    @staticmethod
+    def _page(tmp_path, page_number=1, size=(600, 800)):
+        from PIL import Image
+
+        path = tmp_path / f"page_{page_number}.png"
+        Image.new("RGB", size, "white").save(path)
+        return PageContext(page_number=page_number, width=float(size[0]), height=float(size[1]), page_image_path=path)
+
+    def _run(self, pages, regions, table_res_list, assets=None):
+        from document_process.services import TableStructureService
+
+        with patch(
+            "document_process.services._get_paddle_table_recognizer",
+            return_value=self._predictor(table_res_list),
+        ):
+            return TableStructureService().recognize(pages=pages, regions=regions, assets=assets)
+
+    def test_recovers_html_for_a_table_region(self, tmp_path):
+        page = self._page(tmp_path)
+        region = _region("r1", "table", _bbox(50, 60, 550, 700))
+        structures, issues = self._run(
+            [page], [region], [{"pred_html": self.HTML, "cell_box_list": [[0, 0, 1, 1]] * 3}]
+        )
+        assert issues == []
+        assert len(structures) == 1
+        assert structures[0].html == self.HTML
+        assert structures[0].cell_count == 3
+        assert structures[0].region_id == "r1"
+
+    def test_crops_tight_to_the_region_not_the_padded_asset(self, tmp_path):
+        """The saved crop is padded for the VLM; that padding would read as rows."""
+        from document_process.services import TableStructureService
+
+        page = self._page(tmp_path)
+        region = _region("r1", "table", _bbox(50, 60, 550, 700))
+        predictor = self._predictor([{"pred_html": self.HTML}])
+        with patch("document_process.services._get_paddle_table_recognizer", return_value=predictor):
+            TableStructureService().recognize(pages=[page], regions=[region], assets=[_crop_asset("r1")])
+        sent = predictor.predict.call_args.args[0]
+        assert sent.shape[0] == 700 - 60  # height, tight to the region
+        assert sent.shape[1] == 550 - 50  # width
+
+    def test_figures_are_skipped(self, tmp_path):
+        page = self._page(tmp_path)
+        region = _region("r1", "figure", _bbox(50, 60, 550, 700))
+        structures, issues = self._run([page], [region], [{"pred_html": self.HTML}])
+        assert structures == [] and issues == []
+
+    def test_missing_page_image_warns_without_failing(self, tmp_path):
+        page = PageContext(page_number=1, width=600.0, height=800.0, page_image_path=tmp_path / "gone.png")
+        region = _region("r1", "table", _bbox(50, 60, 550, 700))
+        structures, issues = self._run([page], [region], [{"pred_html": self.HTML}])
+        assert structures == []
+        assert [i.code for i in issues] == ["table_page_image_missing"]
+
+    def test_recognition_failure_is_isolated_to_one_table(self, tmp_path):
+        from document_process.services import TableStructureService
+
+        page = self._page(tmp_path)
+        regions = [
+            _region("r1", "table", _bbox(50, 60, 550, 300)),
+            _region("r2", "table", _bbox(50, 320, 550, 700)),
+        ]
+        predictor = MagicMock()
+        good = MagicMock()
+        good.json = {"res": {"table_res_list": [{"pred_html": self.HTML}]}}
+        predictor.predict.side_effect = [RuntimeError("boom"), [good]]
+
+        with patch("document_process.services._get_paddle_table_recognizer", return_value=predictor):
+            structures, issues = TableStructureService().recognize(pages=[page], regions=regions)
+
+        assert [s.region_id for s in structures] == ["r2"]
+        assert [i.code for i in issues] == ["table_structure_failed"]
+
+    def test_html_becomes_the_visual_summary_text(self, tmp_path):
+        from document_process.models import TableStructure
+
+        region = _region("r1", "table", _bbox(0, 0, 100, 100))
+        block = _text_block("b1", "Cash and cash equivalents $ 24,296 $ 30,242", region_ids=["r1"])
+        structure = TableStructure(
+            table_id="table_r1",
+            region_id="r1",
+            page_number=1,
+            crop_path="/tmp/c.png",
+            html=self.HTML,
+            cell_count=3,
+        )
+        summaries = build_visual_summaries(
+            regions=[region],
+            ordered_blocks=[block],
+            chunks=[],
+            cropped_assets=[],
+            table_structures=[structure],
+        )
+        assert summaries[0].summary_text == self.HTML
+        assert summaries[0].metadata["cell_count"] == 3
+
+    def test_summary_falls_back_to_block_text_without_structure(self):
+        region = _region("r1", "table", _bbox(0, 0, 100, 100))
+        block = _text_block("b1", "Cash and cash equivalents", region_ids=["r1"])
+        summaries = build_visual_summaries(regions=[region], ordered_blocks=[block], chunks=[], cropped_assets=[])
+        assert summaries[0].summary_text == "Cash and cash equivalents"
+        assert "table_html" not in summaries[0].metadata

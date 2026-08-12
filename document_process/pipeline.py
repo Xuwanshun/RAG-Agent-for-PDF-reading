@@ -17,11 +17,13 @@ from document_process.models import (
 )
 from document_process.services import (
     AssociationService,
+    BlockLayoutService,
     CroppingService,
     DocumentLoaderService,
     LayoutDetectionService,
     OCRService,
     ReadingOrderService,
+    TableStructureService,
     build_chunks,
     build_document_artifacts,
     build_visual_summaries,
@@ -52,16 +54,20 @@ class DocumentPreprocessingPipeline:
         ocr: OCRService | None = None,
         reading_order: ReadingOrderService | None = None,
         layout: LayoutDetectionService | None = None,
+        block_layout: BlockLayoutService | None = None,
         association: AssociationService | None = None,
         cropping: CroppingService | None = None,
+        table_structure: TableStructureService | None = None,
     ) -> None:
         self.settings = settings
         self.loader = loader or DocumentLoaderService(settings)
         self.ocr = ocr or OCRService(settings)
         self.reading_order = reading_order or ReadingOrderService(settings)
         self.layout = layout or LayoutDetectionService()
+        self.block_layout = block_layout or BlockLayoutService()
         self.association = association or AssociationService()
         self.cropping = cropping or CroppingService()
+        self.table_structure = table_structure or TableStructureService()
 
     def run(
         self,
@@ -89,6 +95,7 @@ class DocumentPreprocessingPipeline:
         merged_ordered_text_pages: list[dict[str, Any]] = []
         layout_model = "unknown"
         batch_resolver = "unknown"
+        block_model = "unknown"
         next_block_index = 1
         pages_done = 0
 
@@ -124,8 +131,15 @@ class DocumentPreprocessingPipeline:
             regions_batch, layout_issues, layout_model = self.layout.detect(batch, ocr_batch)
             issues.extend(layout_issues)
 
+            block_boxes_batch, block_issues, block_model = self.block_layout.detect(batch)
+            issues.extend(block_issues)
+
             assocs_batch, blocks_batch, ordered_text_batch = self.association.associate(
-                ocr_batch, ro_batch, regions_batch, start_index=next_block_index
+                ocr_batch,
+                ro_batch,
+                regions_batch,
+                start_index=next_block_index,
+                block_boxes=block_boxes_batch,
             )
 
             batch_resolver = ro_batch.get("resolver", "unknown")
@@ -155,6 +169,13 @@ class DocumentPreprocessingPipeline:
             output_dir=loaded.working_dir / "crops",
         )
         issues.extend(crop_issues)
+
+        table_structures = []
+        if self.settings.use_table_structure:
+            table_structures, table_issues = self.table_structure.recognize(
+                pages=all_pages, regions=all_regions, assets=cropped_assets
+            )
+            issues.extend(table_issues)
 
         intel_result = None
         if (
@@ -211,6 +232,7 @@ class DocumentPreprocessingPipeline:
             ordered_blocks=all_ordered_blocks,
             chunks=chunks,
             cropped_assets=cropped_assets,
+            table_structures=table_structures,
         )
 
         if intel_result is not None and intel_result.visual_summaries:
@@ -238,6 +260,7 @@ class DocumentPreprocessingPipeline:
             chunks=chunks,
             reading_order_model=reading_order.get("resolver", "unknown"),
             layout_detection_model=layout_model,
+            block_layout_model=block_model,
             issues=issues,
         )
 
@@ -252,6 +275,7 @@ class DocumentPreprocessingPipeline:
             cropped_assets=cropped_assets,
             visual_summaries=visual_summaries,
             chunks=chunks,
+            table_structures=table_structures,
             document=document,
             metadata=metadata,
             descriptor=intel_result.descriptor if intel_result is not None else None,

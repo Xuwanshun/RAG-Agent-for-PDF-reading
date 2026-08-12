@@ -110,9 +110,17 @@ def _build_pipeline(settings, tmp_path, num_pages: int):
 
     layout_mock.detect.side_effect = layout_detect
 
+    block_layout_mock = MagicMock()
+
+    def block_layout_detect(batch_pages):
+        nums = [p.page_number for p in batch_pages]
+        return {n: [_bbox(0, 0, 100, 200)] for n in nums}, [], "PP-DocBlockLayout"
+
+    block_layout_mock.detect.side_effect = block_layout_detect
+
     assoc_mock = MagicMock()
 
-    def association_associate(batch_ocr, batch_ro, batch_regions, *, start_index=1):
+    def association_associate(batch_ocr, batch_ro, batch_regions, *, start_index=1, block_boxes=None):
         nums = [o.page_number for o in batch_ocr]
         blocks = [_make_block(start_index + i, f"p{n}_ocr_1") for i, n in enumerate(nums)]
         assocs = [
@@ -143,6 +151,7 @@ def _build_pipeline(settings, tmp_path, num_pages: int):
         ocr=ocr_mock,
         reading_order=reading_order_mock,
         layout=layout_mock,
+        block_layout=block_layout_mock,
         association=assoc_mock,
         cropping=crop_mock,
     )

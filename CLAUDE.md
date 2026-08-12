@@ -59,7 +59,10 @@ Two entry points share the same core pipeline:
 
 1. **`document_process/`** — PDF → frozen artifacts
    - `pipeline.py`: orchestrates `DocumentPreprocessingPipeline`
-   - Services chain: `DocumentLoaderService` → `OCRService` (PaddleOCR) → `ReadingOrderService` → `LayoutDetectionService` (PP-DocLayout_plus-L) → `AssociationService` → `CroppingService`
+   - Services chain: `DocumentLoaderService` → `OCRService` (PDF text layer, PaddleOCR only for scans) → `ReadingOrderService` → `LayoutDetectionService` (PP-DocLayout_plus-L) → `BlockLayoutService` (PP-DocBlockLayout) → `AssociationService` → `CroppingService` → `TableStructureService` (opt-in)
+   - **Reading order** is skipped for pages whose text came from the PDF text layer: `_group_rects_into_lines` already returns whole lines top-to-bottom, and the bbox sort's 18px bucket demonstrably swaps adjacent table rows. OCR pages (sub-line fragments) are still sorted. `metadata.json` records which path ran via `reading_order_model` (`pdf_text_layer_order_v1` / `ocr_bbox_sort_v1` / `mixed:…`).
+   - **Block grouping** uses PP-DocBlockLayout region boxes, not a line-height heuristic. Items covered by no block box stay separate; with no boxes available it falls back to the old 20px bucket.
+   - Optional: `TableStructureService` runs PP-TableRecognitionPipelineV2 over the table crops to recover cell structure as HTML (opt-in via `USE_TABLE_STRUCTURE=true`), writing `table_structures.json` and supplying `summary_text` for table regions. Bounded to table crops, not whole pages.
    - `intelligence_service.py`: optional title propagation, section grouping, document descriptor (opt-in via `USE_DOCUMENT_INTELLIGENCE=true`)
    - Optional ingestion stages (code-default off, enabled in production `scripts/set-flags.sh`): adaptive chunking (`USE_ADAPTIVE_CHUNKING`) and LayoutReader-based reading order (`USE_LAYOUT_READER`, model `hantian/layoutreader`)
    - Outputs `document.json`, `chunks.json`, and cropped region images into `data/processed/<document_id>/`
